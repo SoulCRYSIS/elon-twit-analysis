@@ -2,3 +2,6 @@ requests
 pandas
 plotly
 scikit-learn
+pyarrow
+py-clob-client
+python-dotenv
