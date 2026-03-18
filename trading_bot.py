@@ -51,7 +51,7 @@ GAMMA_URL = "https://gamma-api.polymarket.com"
 CLOB_URL = "https://clob.polymarket.com"
 CHAIN_ID = 137
 
-POLL_INTERVAL = 900  # 15 min
+POLL_INTERVAL = 600  # 15 min
 MAX_OPEN_POSITIONS = 10
 DEFAULT_BET_USD = 1.0
 PRICE_HISTORY_HOURS = 48  # Keep 48h in memory for momentum/volatility features
@@ -308,6 +308,10 @@ def _compute_history_features(df: pd.DataFrame) -> pd.DataFrame:
         if col not in df.columns:
             df[col] = 0.0
 
+    n_rows = len(df)
+    if n_rows > 50 and len(_price_history) < 10:
+        print(f"  Computing history features for {n_rows} brackets (first run, may take 1–2 min)...", flush=True)
+
     for i, row in df.iterrows():
         cid = row.get("condition_id", "")
         token_id = row.get("token_id", "")
@@ -515,7 +519,7 @@ def load_or_train_model() -> dict:
         test_days=120,
         brackets_away_min=1.5,
         brackets_away_max=6.0,
-        verbose=False,
+        verbose=True,
     )
 
     MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -556,8 +560,8 @@ def refresh_data_and_retrain() -> dict | None:
         # Use incremental: only fetch new events + append new price data (fast)
         parquet = POLYMARKET_DIR / "bracket_prices.parquet"
         incremental = parquet.exists()  # We have prior data, do incremental
-        print("  Fetching Polymarket data (incremental)..." if incremental else "  Fetching Polymarket data (full)...")
-        df, _ = get_polymarket_data(incremental=incremental, force_refresh=False, verbose=False)
+        print("  Fetching Polymarket data (incremental)..." if incremental else "  Fetching Polymarket data (full)...", flush=True)
+        df, _ = get_polymarket_data(incremental=incremental, force_refresh=False, verbose=True)
         if df.empty:
             print("  Retrain skipped: no data")
             return None
@@ -565,7 +569,7 @@ def refresh_data_and_retrain() -> dict | None:
         print("  Building features and retraining...")
         featured = build_bracket_features(df)
         labeled = add_return_labels(featured)
-        info = train_outcome_model(labeled, test_days=120, brackets_away_min=1.5, brackets_away_max=6.0, verbose=False)
+        info = train_outcome_model(labeled, test_days=120, brackets_away_min=1.5, brackets_away_max=6.0, verbose=True)
 
         import pickle
         with open(MODEL_PATH, "wb") as f:
@@ -718,12 +722,14 @@ def run_bot():
                 if new_info is not None:
                     model_info = new_info
 
+            print("  Fetching active events...", flush=True)
             events = fetch_active_events()
             if not events:
                 print("  No active events")
                 time.sleep(POLL_INTERVAL)
                 continue
 
+            print(f"  Found {len(events)} active events, fetching prices...", flush=True)
             df = fetch_current_prices(events)
             if df.empty:
                 print("  No price data")

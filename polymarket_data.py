@@ -369,6 +369,8 @@ def fetch_all_price_histories(
     """
     _ensure_dirs()
     total = sum(len(e.get("markets", [])) for e in events)
+    if verbose:
+        print(f"  Fetching price history for {total} markets...", flush=True)
     fetched = 0
     got_data = 0
     incremental_count = 0
@@ -383,23 +385,28 @@ def fetch_all_price_histories(
                 continue
             yes_token = tokens[0]
             cache = PRICES_DIR / f"{cond_id}.json"
-            use_incremental = incremental and cache.exists() and not force_refresh
-            if use_incremental:
+            # Incremental: skip markets we already have (no API call)
+            if incremental and cache.exists() and not force_refresh:
                 incremental_count += 1
+                fetched += 1
+                got_data += 1  # We have data in cache
+                if verbose and fetched % 20 == 0 and fetched > 0:
+                    print(f"  Price history: {fetched}/{total} ({got_data} with data, {incremental_count} skipped)", flush=True)
+                continue
             history = fetch_price_history(
                 yes_token, cond_id,
                 event_start=event_start, event_end=event_end,
                 force_refresh=force_refresh,
-                incremental=use_incremental,
+                incremental=False,
             )
             fetched += 1
             if history:
                 got_data += 1
-            if verbose and fetched % 50 == 0:
-                print(f"  Price history: {fetched}/{total} ({got_data} with data, {incremental_count} incremental)")
+            if verbose and fetched % 20 == 0 and fetched > 0:
+                print(f"  Price history: {fetched}/{total} ({got_data} with data, {incremental_count} incremental)", flush=True)
 
     if verbose:
-        print(f"  Price history: {fetched}/{total} done ({got_data} with data, {incremental_count} incremental)")
+        print(f"  Price history: {fetched}/{total} done ({got_data} with data, {incremental_count} skipped)", flush=True)
     return fetched
 
 
@@ -411,9 +418,11 @@ def build_bracket_dataframe(events: list[dict], *, verbose: bool = True) -> pd.D
     """Build a flat DataFrame of (event, bracket, timestamp, price)."""
     if PARQUET_PATH.exists():
         if verbose:
-            print(f"Loading cached bracket data from {PARQUET_PATH}")
+            print(f"Loading cached bracket data from {PARQUET_PATH}", flush=True)
         return pd.read_parquet(PARQUET_PATH)
 
+    if verbose:
+        print("  Building bracket DataFrame from price caches (may take 1–2 min)...", flush=True)
     rows: list[dict] = []
     for e in events:
         slug = e.get("slug", "")
@@ -462,7 +471,7 @@ def build_bracket_dataframe(events: list[dict], *, verbose: bool = True) -> pd.D
 
     df.to_parquet(PARQUET_PATH, index=False)
     if verbose:
-        print(f"Saved {len(df)} rows to {PARQUET_PATH}")
+        print(f"  Saved {len(df)} rows to {PARQUET_PATH}", flush=True)
     return df
 
 
@@ -489,7 +498,7 @@ def get_polymarket_data(
     )
     bracket_events = filter_bracket_events(events, min_markets=min_markets)
     if verbose:
-        print(f"{len(bracket_events)} bracket events (of {len(events)} total)")
+        print(f"{len(bracket_events)} bracket events (of {len(events)} total)", flush=True)
 
     if force_refresh or not PARQUET_PATH.exists() or incremental:
         fetch_all_price_histories(
