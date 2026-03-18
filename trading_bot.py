@@ -282,8 +282,23 @@ def _append_prices_to_history(df: pd.DataFrame):
             hist.pop(0)
 
 
-def _fetch_clob_history(token_id: str, condition_id: str) -> list[tuple[int, float]]:
-    """Fetch last 24h from CLOB prices-history for backfill. Returns [(ts, price), ...]."""
+PRICES_CACHE_DIR = POLYMARKET_DIR / "prices"
+
+
+def _load_history_from_cache_or_api(condition_id: str, token_id: str) -> tuple[list[tuple[int, float]], bool]:
+    """Load price history. Returns (data, used_cache). Use cache file if exists; else fetch from CLOB API."""
+    cache_path = PRICES_CACHE_DIR / f"{condition_id}.json"
+    if cache_path.exists():
+        try:
+            with open(cache_path) as f:
+                pts = json.load(f)
+            if pts:
+                data = [(p["t"], p["p"]) for p in pts if isinstance(p, dict) and "t" in p and "p" in p]
+                if data:
+                    return (data, True)
+        except (json.JSONDecodeError, TypeError):
+            pass
+    # Fallback: fetch from API
     now_ts = int(datetime.now(timezone.utc).timestamp())
     start_ts = now_ts - 24 * 3600
     try:
@@ -295,9 +310,9 @@ def _fetch_clob_history(token_id: str, condition_id: str) -> list[tuple[int, flo
         )
         resp.raise_for_status()
         pts = resp.json().get("history", [])
-        return [(p["t"], p["p"]) for p in pts if "t" in p and "p" in p]
+        return ([(p["t"], p["p"]) for p in pts if "t" in p and "p" in p], False)
     except Exception:
-        return []
+        return ([], False)
 
 
 def _compute_history_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -312,19 +327,38 @@ def _compute_history_features(df: pd.DataFrame) -> pd.DataFrame:
     if n_rows > 50 and len(_price_history) < 10:
         print(f"  Computing history features for {n_rows} brackets (first run, may take 1–2 min)...", flush=True)
 
-    for i, row in df.iterrows():
-        cid = row.get("condition_id", "")
-        token_id = row.get("token_id", "")
-        price = float(row.get("price", 0))
-
-        hist = _price_history.get(cid)
-        if not hist and token_id:
-            backfill = _fetch_clob_history(token_id, cid)
+    # Pre-load all histories from cache/API (avoids slow per-row df.at[] in loop)
+    step = max(1, n_rows // 10)
+    for idx, row in enumerate(df.itertuples(index=False)):
+        if n_rows > 50 and (idx + 1) % step == 0:
+            print(f"    ... {idx + 1}/{n_rows} brackets", flush=True)
+        cid = getattr(row, "condition_id", "") or ""
+        token_id = getattr(row, "token_id", "") or ""
+        if not cid or not token_id:
+            continue
+        if cid not in _price_history:
+            backfill, used_cache = _load_history_from_cache_or_api(cid, token_id)
             if backfill:
                 _price_history[cid] = sorted(backfill, key=lambda x: x[0])
-                hist = _price_history[cid]
-            time.sleep(0.05)
+            if not used_cache:
+                time.sleep(0.05)
+
+    # Compute features in bulk (much faster than df.at[] per cell)
+    price_changes = {f"price_change_{h}h": [] for h in [1, 3, 6, 12, 24]}
+    price_vols = {f"price_vol_{w}h": [] for w in [6, 12, 24]}
+    price_pct_ranges = []
+
+    for row in df.itertuples(index=False):
+        cid = getattr(row, "condition_id", "") or ""
+        price = float(getattr(row, "price", 0))
+        hist = _price_history.get(cid) if cid else None
+
         if not hist:
+            for k in price_changes:
+                price_changes[k].append(0.0)
+            for k in price_vols:
+                price_vols[k].append(0.0)
+            price_pct_ranges.append(0.0)
             continue
 
         prices = [p for _, p in hist]
@@ -335,23 +369,29 @@ def _compute_history_features(df: pd.DataFrame) -> pd.DataFrame:
             closest = min(ts_list, key=lambda t: abs(t - target_ts))
             if abs(closest - target_ts) <= 2 * 3600:
                 idx = ts_list.index(closest)
-                df.at[i, f"price_change_{lag_h}h"] = price - prices[idx]
+                price_changes[f"price_change_{lag_h}h"].append(price - prices[idx])
             else:
-                df.at[i, f"price_change_{lag_h}h"] = 0.0
+                price_changes[f"price_change_{lag_h}h"].append(0.0)
 
         for win in [6, 12, 24]:
             recent = [(t, p) for t, p in hist if t >= now_ts - win * 3600]
             if len(recent) >= 2:
                 vals = [p for _, p in recent]
-                df.at[i, f"price_vol_{win}h"] = float(np.std(vals))
+                price_vols[f"price_vol_{win}h"].append(float(np.std(vals)))
             else:
-                df.at[i, f"price_vol_{win}h"] = 0.0
+                price_vols[f"price_vol_{win}h"].append(0.0)
 
         pmin, pmax = min(prices), max(prices)
         if pmax > pmin:
-            df.at[i, "price_pct_range"] = (price - pmin) / (pmax - pmin)
+            price_pct_ranges.append((price - pmin) / (pmax - pmin))
         else:
-            df.at[i, "price_pct_range"] = 0.0
+            price_pct_ranges.append(0.0)
+
+    for col, vals in price_changes.items():
+        df[col] = vals
+    for col, vals in price_vols.items():
+        df[col] = vals
+    df["price_pct_range"] = price_pct_ranges
 
     ts_grp = df.groupby("event_slug")
     price_sum = ts_grp["price"].transform("sum")
@@ -600,14 +640,30 @@ def should_retrain() -> bool:
 # Trading logic
 # ---------------------------------------------------------------------------
 
-def score_candidates(df: pd.DataFrame, model_info: dict, pred_min: float = None, proba_min: float = None) -> pd.DataFrame:
-    candidates = df[
+def score_candidates(
+    df: pd.DataFrame,
+    model_info: dict,
+    pred_min: float = None,
+    proba_min: float = None,
+    *,
+    verbose: bool = True,
+) -> pd.DataFrame:
+    """Score brackets for buy; return those passing pred and proba thresholds."""
+    mask = (
         (df["price"] < 0.02) & (df["price"] > 0.001) &
         (df["brackets_away"] >= 1.5) & (df["brackets_away"] <= 6.0) &
         (df["hours_remaining"] > 24)
-    ].copy()
+    )
+    candidates = df[mask].copy()
 
     if candidates.empty:
+        if verbose:
+            n_total = len(df)
+            n_price = ((df["price"] < 0.02) & (df["price"] > 0.001)).sum()
+            n_brackets = ((df["brackets_away"] >= 1.5) & (df["brackets_away"] <= 6.0)).sum()
+            n_hrs = (df["hours_remaining"] > 24).sum()
+            print(f"  No pre-filter candidates: {n_total} brackets total, {n_price} in price range, "
+                  f"{n_brackets} in bracket range, {n_hrs} with >24h left", flush=True)
         return candidates
 
     features = model_info["feature_names"]
@@ -627,7 +683,26 @@ def score_candidates(df: pd.DataFrame, model_info: dict, pred_min: float = None,
     pred_thresh = pred_min if pred_min is not None else PRED_THRESHOLD
     proba_thresh = proba_min if proba_min is not None else JACKPOT_PROBA_THRESHOLD
     passed = (candidates["_pred"] >= pred_thresh) & (candidates["_proba"] >= proba_thresh)
-    return candidates[passed].sort_values("_pred", ascending=False)
+    result = candidates[passed].sort_values("_pred", ascending=False)
+
+    # Fallback: classifier can be overly conservative on live (sparse history). If pred passes but proba blocks
+    # everyone, use pred-only for candidates with pred >= threshold.
+    if result.empty:
+        pred_only = candidates[candidates["_pred"] >= pred_thresh].sort_values("_pred", ascending=False)
+        if not pred_only.empty and verbose:
+            proba_max = float(candidates["_proba"].max())
+            print(f"  Using pred-only fallback ({len(pred_only)} candidates): proba max={proba_max:.3f} < {proba_thresh}", flush=True)
+        result = pred_only
+
+    if result.empty and verbose:
+        pred_max, pred_mean = float(candidates["_pred"].max()), float(candidates["_pred"].mean())
+        proba_max, proba_mean = float(candidates["_proba"].max()), float(candidates["_proba"].mean())
+        n_pred_ok = (candidates["_pred"] >= pred_thresh).sum()
+        n_proba_ok = (candidates["_proba"] >= proba_thresh).sum()
+        print(f"  {len(candidates)} pre-filter candidates, 0 pass: pred>={pred_thresh} (max={pred_max:.1f}, "
+              f"mean={pred_mean:.1f}, {n_pred_ok} pass) & proba>={proba_thresh} (max={proba_max:.3f}, "
+              f"mean={proba_mean:.3f}, {n_proba_ok} pass)", flush=True)
+    return result
 
 
 def place_buy_order(client, token_id: str, price: float, usd_amount: float, tick_size: str = "0.01") -> dict | None:
@@ -792,9 +867,13 @@ def run_bot():
             # --- BUY: score and place orders ---
             cooldown_h = config.get("buy_cooldown_hours", BUY_COOLDOWN_HOURS)
             price_ratio = config.get("buy_again_price_ratio", BUY_AGAIN_PRICE_RATIO)
-            if n_positions < max_pos:
+            if n_positions >= max_pos:
+                print(f"  At max positions ({n_positions}/{max_pos}), skipping buy scan", flush=True)
+            else:
                 scored = score_candidates(df, model_info, config.get("pred_min"), config.get("proba_min"))
-                if not scored.empty:
+                if scored.empty:
+                    print("  No buy candidates (price/pred/proba filters)", flush=True)
+                else:
                     for _, row in scored.iterrows():
                         if n_positions >= max_pos:
                             break
