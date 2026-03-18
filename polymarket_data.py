@@ -38,13 +38,21 @@ def _ensure_dirs():
 # Event discovery
 # ---------------------------------------------------------------------------
 
-def search_elon_tweet_events(*, force_refresh: bool = False, verbose: bool = True) -> list[dict]:
-    """Discover all Elon Musk tweet bracket events from Polymarket."""
-    if EVENTS_CACHE.exists() and not force_refresh:
+def search_elon_tweet_events(*, force_refresh: bool = False, incremental: bool = False, verbose: bool = True) -> list[dict]:
+    """Discover all Elon Musk tweet bracket events from Polymarket.
+
+    If incremental=True: fetch search slugs, only get details for slugs not in cache, merge.
+    """
+    cached: list[dict] = []
+    if EVENTS_CACHE.exists():
+        with open(EVENTS_CACHE) as f:
+            cached = json.load(f)
+    cached_slugs = {e.get("slug") for e in cached if e.get("slug")}
+
+    if cached and not force_refresh and not incremental:
         if verbose:
             print(f"Loading cached events from {EVENTS_CACHE}")
-        with open(EVENTS_CACHE) as f:
-            return json.load(f)
+        return cached
 
     _ensure_dirs()
     all_slugs: list[dict] = []
@@ -68,13 +76,21 @@ def search_elon_tweet_events(*, force_refresh: bool = False, verbose: bool = Tru
         page += 1
         time.sleep(REQUEST_DELAY)
 
-    if verbose:
-        print(f"Found {len(all_slugs)} search results, fetching full details...")
+    search_slugs = {s.get("slug") for s in all_slugs if s.get("slug")}
+    new_slugs = search_slugs - cached_slugs if incremental and cached else search_slugs
 
-    full_events: list[dict] = []
+    if incremental and cached and not new_slugs:
+        if verbose:
+            print("  No new events, using cache")
+        return cached
+
+    if verbose:
+        print(f"Found {len(all_slugs)} search results, fetching {len(new_slugs)} new event details...")
+
+    full_events: list[dict] = [] if not incremental else [e for e in cached if e.get("slug") in search_slugs]
     for i, stub in enumerate(all_slugs):
         slug = stub.get("slug", "")
-        if not slug:
+        if not slug or (incremental and slug in cached_slugs):
             continue
         resp = requests.get(f"{GAMMA_URL}/events", params={"slug": slug})
         resp.raise_for_status()
@@ -82,13 +98,14 @@ def search_elon_tweet_events(*, force_refresh: bool = False, verbose: bool = Tru
         if arr and isinstance(arr, list) and arr[0].get("markets"):
             full_events.append(arr[0])
         if verbose and (i + 1) % 20 == 0:
-            print(f"  Fetched {i + 1}/{len(all_slugs)} event details")
+            print(f"  Fetched {i + 1}/{len(new_slugs)} new event details")
         time.sleep(REQUEST_DELAY)
 
+    full_events.sort(key=lambda e: (e.get("startDate") or "", e.get("slug") or ""))
     with open(EVENTS_CACHE, "w") as f:
         json.dump(full_events, f)
     if verbose:
-        print(f"Cached {len(full_events)} events with market details to {EVENTS_CACHE}")
+        print(f"Cached {len(full_events)} events ({len(new_slugs)} new)")
     return full_events
 
 
@@ -217,6 +234,17 @@ def _data_api_trades(token_id: str, limit: int = 10000) -> list[dict]:
     return [{"t": int(ts.timestamp()), "p": round(float(p), 6)} for ts, p in hourly.items()]
 
 
+def _merge_and_dedup_history(existing: list[dict], new_points: list[dict]) -> list[dict]:
+    """Merge new points into existing, dedupe by timestamp, sort."""
+    seen = {p["t"] for p in existing}
+    for p in new_points:
+        t = p.get("t")
+        if t is not None and t not in seen:
+            seen.add(t)
+            existing.append(p)
+    return sorted(existing, key=lambda x: x["t"])
+
+
 def fetch_price_history(
     token_id: str,
     condition_id: str,
@@ -224,36 +252,70 @@ def fetch_price_history(
     event_end: str | None = None,
     *,
     force_refresh: bool = False,
+    incremental: bool = False,
 ) -> list[dict]:
-    """Fetch hourly price history using chunked CLOB queries + Data API fallback."""
+    """Fetch hourly price history using chunked CLOB queries + Data API fallback.
+
+    If incremental=True and cache exists: fetch only from last_ts to now, merge, save.
+    """
     cache = PRICES_DIR / f"{condition_id}.json"
-    if cache.exists() and not force_refresh:
+    existing: list[dict] = []
+    if cache.exists():
         with open(cache) as f:
-            data = json.load(f)
-        if data:
-            return data
+            existing = json.load(f) or []
+        if existing and not force_refresh and not incremental:
+            return existing
 
     _ensure_dirs()
 
-    # Determine time range from event dates (with padding)
     now = datetime.now(timezone.utc)
-    if event_start:
-        try:
-            dt_start = datetime.fromisoformat(event_start.replace("Z", "+00:00"))
-        except ValueError:
-            dt_start = now - timedelta(days=30)
-        start_ts = int((dt_start - timedelta(days=3)).timestamp())
-    else:
-        start_ts = int((now - timedelta(days=30)).timestamp())
+    start_ts: int
+    end_ts = int(now.timestamp())
 
-    if event_end:
-        try:
-            dt_end = datetime.fromisoformat(event_end.replace("Z", "+00:00"))
-        except ValueError:
-            dt_end = now
-        end_ts = int((dt_end + timedelta(days=1)).timestamp())
+    if incremental and existing:
+        # Only fetch new data since last point
+        last_ts = max(p.get("t", 0) for p in existing)
+        start_ts = last_ts + 3600  # 1h after last to avoid overlap
+        if start_ts >= end_ts:
+            return existing  # No new data
+        new_points = _clob_chunked(token_id, start_ts, end_ts)
+        if not new_points:
+            try:
+                resp = requests.get(
+                    f"{CLOB_URL}/prices-history",
+                    params={"market": token_id, "startTs": start_ts, "endTs": end_ts, "fidelity": 60},
+                    headers={"Accept": "application/json"},
+                    timeout=15,
+                )
+                resp.raise_for_status()
+                new_points = resp.json().get("history", [])
+            except Exception:
+                pass
+        if new_points:
+            history = _merge_and_dedup_history(existing, new_points)
+            with open(cache, "w") as f:
+                json.dump(history, f)
+            return history
+        return existing
     else:
-        end_ts = int(now.timestamp())
+        # Full fetch: determine time range from event dates
+        if event_start:
+            try:
+                dt_start = datetime.fromisoformat(event_start.replace("Z", "+00:00"))
+            except ValueError:
+                dt_start = now - timedelta(days=30)
+            start_ts = int((dt_start - timedelta(days=3)).timestamp())
+        else:
+            start_ts = int((now - timedelta(days=30)).timestamp())
+
+        if event_end:
+            try:
+                dt_end = datetime.fromisoformat(event_end.replace("Z", "+00:00"))
+            except ValueError:
+                dt_end = now
+            end_ts = int((dt_end + timedelta(days=1)).timestamp())
+        else:
+            end_ts = int(now.timestamp())
 
     # Strategy 1: chunked CLOB with startTs/endTs
     history = _clob_chunked(token_id, start_ts, end_ts)
@@ -297,13 +359,19 @@ def fetch_all_price_histories(
     events: list[dict],
     *,
     force_refresh: bool = False,
+    incremental: bool = False,
     verbose: bool = True,
 ) -> int:
-    """Fetch and cache price histories for every bracket in the given events."""
+    """Fetch and cache price histories for every bracket in the given events.
+
+    If incremental=True: only fetch new data (from last_ts to now) for existing caches;
+    full fetch for markets with no cache.
+    """
     _ensure_dirs()
     total = sum(len(e.get("markets", [])) for e in events)
     fetched = 0
     got_data = 0
+    incremental_count = 0
 
     for e in events:
         event_start = e.get("startDate")
@@ -314,19 +382,24 @@ def fetch_all_price_histories(
             if not tokens or not cond_id:
                 continue
             yes_token = tokens[0]
+            cache = PRICES_DIR / f"{cond_id}.json"
+            use_incremental = incremental and cache.exists() and not force_refresh
+            if use_incremental:
+                incremental_count += 1
             history = fetch_price_history(
                 yes_token, cond_id,
                 event_start=event_start, event_end=event_end,
                 force_refresh=force_refresh,
+                incremental=use_incremental,
             )
             fetched += 1
             if history:
                 got_data += 1
             if verbose and fetched % 50 == 0:
-                print(f"  Price history: {fetched}/{total} ({got_data} with data)")
+                print(f"  Price history: {fetched}/{total} ({got_data} with data, {incremental_count} incremental)")
 
     if verbose:
-        print(f"  Price history: {fetched}/{total} done ({got_data} with data)")
+        print(f"  Price history: {fetched}/{total} done ({got_data} with data, {incremental_count} incremental)")
     return fetched
 
 
@@ -400,17 +473,31 @@ def build_bracket_dataframe(events: list[dict], *, verbose: bool = True) -> pd.D
 def get_polymarket_data(
     *,
     force_refresh: bool = False,
+    incremental: bool = False,
     verbose: bool = True,
     min_markets: int = 5,
 ) -> tuple[pd.DataFrame, list[dict]]:
-    """End-to-end: discover events, fetch prices, build DataFrame."""
-    events = search_elon_tweet_events(force_refresh=force_refresh, verbose=verbose)
+    """End-to-end: discover events, fetch prices, build DataFrame.
+
+    If incremental=True: only fetch new events and append new price data (fast).
+    Use incremental for periodic retrains; use force_refresh for full rebuild.
+    """
+    events = search_elon_tweet_events(
+        force_refresh=force_refresh and not incremental,
+        incremental=incremental,
+        verbose=verbose,
+    )
     bracket_events = filter_bracket_events(events, min_markets=min_markets)
     if verbose:
         print(f"{len(bracket_events)} bracket events (of {len(events)} total)")
 
-    if force_refresh or not PARQUET_PATH.exists():
-        fetch_all_price_histories(bracket_events, force_refresh=force_refresh, verbose=verbose)
+    if force_refresh or not PARQUET_PATH.exists() or incremental:
+        fetch_all_price_histories(
+            bracket_events,
+            force_refresh=force_refresh and not incremental,
+            incremental=incremental,
+            verbose=verbose,
+        )
         if PARQUET_PATH.exists():
             PARQUET_PATH.unlink()
 

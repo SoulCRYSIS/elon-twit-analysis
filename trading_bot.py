@@ -16,7 +16,9 @@ Data (persists across restarts):
   MAX_POSITIONS           - Max open positions (default 20)
   BUY_COOLDOWN_HOURS      - Hours before adding to same bracket again (default 24)
   BUY_AGAIN_PRICE_RATIO   - Only add when price < last/this (default 3 = must be 3x lower)
+  DRY_RUN_START_BALANCE   - Simulated starting $ for dry run (default 100)
   DRY_RUN                 - Set to "true" to disable real orders
+  RETRAIN_HOURS           - Hours between data fetch + model retrain (default 24, 0=disabled)
 """
 
 from __future__ import annotations
@@ -40,6 +42,8 @@ DATA_DIR = ROOT / "data"
 POLYMARKET_DIR = DATA_DIR / "polymarket"
 HOLDINGS_PATH = DATA_DIR / "holdings.json"  # Positions — loaded on bot restart (real mode only)
 DRY_RUN_HOLDINGS_PATH = DATA_DIR / "dry_run_holdings.json"  # Simulated positions when --dry-run
+DRY_RUN_STATE_PATH = DATA_DIR / "dry_run_state.json"  # balance, start_balance (persists across restarts)
+DRY_RUN_TRANSACTIONS_PATH = DATA_DIR / "dry_run_transactions.jsonl"  # Simulated buy/sell log
 TRANSACTIONS_PATH = DATA_DIR / "transactions.jsonl"  # Buy/sell log
 MODEL_PATH = DATA_DIR / "model_outcome.pkl"
 
@@ -47,16 +51,20 @@ GAMMA_URL = "https://gamma-api.polymarket.com"
 CLOB_URL = "https://clob.polymarket.com"
 CHAIN_ID = 137
 
-POLL_INTERVAL = 300  # 5 min
-MAX_OPEN_POSITIONS = 20
+POLL_INTERVAL = 900  # 15 min
+MAX_OPEN_POSITIONS = 10
 DEFAULT_BET_USD = 1.0
 PRICE_HISTORY_HOURS = 48  # Keep 48h in memory for momentum/volatility features
 PRED_THRESHOLD = 6.0  # Min predicted jackpot potential; set PRED_MIN in .env
 JACKPOT_PROBA_THRESHOLD = 0.01  # Min P(jackpot); classifier is conservative on live (no history)
 SELL_TARGET_X = 4.5
 SELL_1DAY_HOURS = 24
-BUY_COOLDOWN_HOURS = 12  # Don't add to same bracket within this many hours
-BUY_AGAIN_PRICE_RATIO = 3.0  # Only add when price < last_buy_price / this (averaging down)
+BUY_COOLDOWN_HOURS = 4  # Don't add to same bracket within this many hours
+BUY_AGAIN_PRICE_RATIO = 2.0  # Only add when price < last_buy_price / this (averaging down)
+DRY_RUN_START_BALANCE = 100.0  # Simulated starting balance for performance testing
+RETRAIN_HOURS = 24.0  # Hours between data fetch + retrain; 0 = disabled
+
+RETRAIN_STATE_PATH = DATA_DIR / "retrain_state.json"
 
 
 # ---------------------------------------------------------------------------
@@ -77,6 +85,7 @@ def load_config() -> dict:
         "proba_min": float(os.getenv("JACKPOT_PROBA_MIN", JACKPOT_PROBA_THRESHOLD)),
         "buy_cooldown_hours": float(os.getenv("BUY_COOLDOWN_HOURS", BUY_COOLDOWN_HOURS)),
         "buy_again_price_ratio": float(os.getenv("BUY_AGAIN_PRICE_RATIO", BUY_AGAIN_PRICE_RATIO)),
+        "dry_run_start_balance": float(os.getenv("DRY_RUN_START_BALANCE", DRY_RUN_START_BALANCE)),
     }
 
 
@@ -113,6 +122,45 @@ def save_holdings(holdings: list[dict]):
     HOLDINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
     with open(HOLDINGS_PATH, "w") as f:
         json.dump(holdings, f, indent=2)
+
+
+def load_dry_run_state(start_balance: float = DRY_RUN_START_BALANCE) -> dict:
+    """Load or init dry run state. Returns {balance, start_balance}."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    if DRY_RUN_STATE_PATH.exists():
+        with open(DRY_RUN_STATE_PATH) as f:
+            return json.load(f)
+    state = {"balance": start_balance, "start_balance": start_balance}
+    with open(DRY_RUN_STATE_PATH, "w") as f:
+        json.dump(state, f, indent=2)
+    return state
+
+
+def save_dry_run_state(state: dict):
+    with open(DRY_RUN_STATE_PATH, "w") as f:
+        json.dump(state, f, indent=2)
+
+
+def log_dry_transaction(action: str, **kwargs):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    entry = {"time": datetime.now(timezone.utc).isoformat(), "action": action, **kwargs}
+    with open(DRY_RUN_TRANSACTIONS_PATH, "a") as f:
+        f.write(json.dumps(entry) + "\n")
+
+
+def remove_dry_holding(slug: str, bracket: str) -> dict | None:
+    """Remove from dry_run_holdings. Returns the removed holding or None."""
+    if not DRY_RUN_HOLDINGS_PATH.exists():
+        return None
+    with open(DRY_RUN_HOLDINGS_PATH) as f:
+        holdings = json.load(f)
+    removed = next((h for h in holdings if h["event_slug"] == slug and h["bracket_label"] == bracket), None)
+    if not removed:
+        return None
+    holdings = [h for h in holdings if not (h["event_slug"] == slug and h["bracket_label"] == bracket)]
+    with open(DRY_RUN_HOLDINGS_PATH, "w") as f:
+        json.dump(holdings, f, indent=2)
+    return removed
 
 
 def add_dry_holding(slug: str, bracket: str, price: float, shares: float, token_id: str):
@@ -456,6 +504,73 @@ def load_or_train_model() -> dict:
     return info
 
 
+def _get_last_retrain_time() -> datetime | None:
+    """Return last retrain timestamp or None if never."""
+    if not RETRAIN_STATE_PATH.exists():
+        return None
+    try:
+        with open(RETRAIN_STATE_PATH) as f:
+            data = json.load(f)
+        s = data.get("last_retrain")
+        if s:
+            return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except (json.JSONDecodeError, ValueError, KeyError):
+        pass
+    return None
+
+
+def _save_retrain_time(ts: datetime):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    with open(RETRAIN_STATE_PATH, "w") as f:
+        json.dump({"last_retrain": ts.isoformat()}, f, indent=2)
+
+
+def refresh_data_and_retrain() -> dict | None:
+    """Fetch new Polymarket data (incremental) and retrain the model. Returns new model_info or None on failure."""
+    from polymarket_data import get_polymarket_data
+    from pm_features import build_bracket_features, add_return_labels
+    from pm_outcome import train_outcome_model
+
+    try:
+        # Use incremental: only fetch new events + append new price data (fast)
+        parquet = POLYMARKET_DIR / "bracket_prices.parquet"
+        incremental = parquet.exists()  # We have prior data, do incremental
+        print("  Fetching Polymarket data (incremental)..." if incremental else "  Fetching Polymarket data (full)...")
+        df, _ = get_polymarket_data(incremental=incremental, force_refresh=False, verbose=False)
+        if df.empty:
+            print("  Retrain skipped: no data")
+            return None
+
+        print("  Building features and retraining...")
+        featured = build_bracket_features(df)
+        labeled = add_return_labels(featured)
+        info = train_outcome_model(labeled, test_days=120, brackets_away_min=1.5, brackets_away_max=6.0, verbose=False)
+
+        import pickle
+        with open(MODEL_PATH, "wb") as f:
+            pickle.dump(info, f)
+        _save_retrain_time(datetime.now(timezone.utc))
+        print(f"  Model retrained. Features: {len(info['feature_names'])}")
+        return info
+    except Exception as e:
+        print(f"  Retrain failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
+def should_retrain() -> bool:
+    """True if it's time to run data fetch + retrain."""
+    hours = float(os.getenv("RETRAIN_HOURS", RETRAIN_HOURS))
+    if hours <= 0:
+        return False
+    last = _get_last_retrain_time()
+    if last is None:
+        return True  # Never retrained, do it on first opportunity
+    elapsed = (datetime.now(timezone.utc) - last).total_seconds() / 3600
+    return elapsed >= hours
+
+
 # ---------------------------------------------------------------------------
 # Trading logic
 # ---------------------------------------------------------------------------
@@ -547,14 +662,26 @@ def run_bot():
         print(f"Holdings saved to: {HOLDINGS_PATH}")
     else:
         client = None
-        print("DRY RUN - no real orders")
-        print(f"Simulated holdings saved to: {DRY_RUN_HOLDINGS_PATH}")
+        print("DRY RUN - no real orders (runs exactly like normal: buys, sells, balance)")
+        state = load_dry_run_state(config.get("dry_run_start_balance", DRY_RUN_START_BALANCE))
+        print(f"Balance: ${state['balance']:.2f}  (start: ${state['start_balance']:.2f})")
+        print(f"State: {DRY_RUN_STATE_PATH}")
+        print(f"Holdings: {DRY_RUN_HOLDINGS_PATH}")
+        print(f"Transactions: {DRY_RUN_TRANSACTIONS_PATH}")
 
-    print(f"Config: bet=${config['bet_usd']}, max_positions={config['max_positions']}, poll={POLL_INTERVAL}s")
+    retrain_h = float(os.getenv("RETRAIN_HOURS", RETRAIN_HOURS))
+    print(f"Config: bet=${config['bet_usd']}, max_positions={config['max_positions']}, poll={POLL_INTERVAL}s, retrain_every={retrain_h}h")
     holdings = load_holdings(dry_run=dry_run)
     holdings_path = DRY_RUN_HOLDINGS_PATH if dry_run else HOLDINGS_PATH
-    if holdings:
-        print(f"Loaded {len(holdings)} position(s) from {holdings_path}")
+    print(f"Holdings ({holdings_path}):")
+    for h in holdings:
+        ev = _fmt_event(h["event_slug"])
+        print(f"  {ev}  bracket {h['bracket_label']}  @ {h['buy_price']:.4f}  x{h['shares']:.0f}")
+    if not holdings:
+        print("  (none)")
+    if dry_run:
+        state = load_dry_run_state()
+        print(f"Balance: ${state['balance']:.2f}  (start: ${state['start_balance']:.2f})")
     print(f"Transactions: {TRANSACTIONS_PATH}")
     print("Press Ctrl+C to stop.\n")
 
@@ -563,6 +690,12 @@ def run_bot():
             config = load_config()
             now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
             print(f"[{now}] Checking...")
+
+            # Periodic data fetch + retrain
+            if should_retrain():
+                new_info = refresh_data_and_retrain()
+                if new_info is not None:
+                    model_info = new_info
 
             events = fetch_active_events()
             if not events:
@@ -601,15 +734,33 @@ def run_bot():
                     should_sell = True
                     reason = f"1 day left ({ret:.1f}x)"
 
-                if should_sell and not dry_run and client:
-                    resp = place_sell_order(client, h["token_id"], current, int(h["shares"]))
-                    if resp:
-                        remove_holding(h["event_slug"], h["bracket_label"])
-                        profit = (current - buy_price) * h["shares"]
-                        log_transaction("sell", event_slug=h["event_slug"], bracket=h["bracket_label"],
-                                        buy_price=buy_price, sell_price=current, shares=h["shares"],
-                                        return_x=ret, profit_usd=profit)
-                        _print_sell(h["event_slug"], h["bracket_label"], current, reason)
+                if should_sell:
+                    if dry_run:
+                        removed = remove_dry_holding(h["event_slug"], h["bracket_label"])
+                        if removed:
+                            proceeds = current * h["shares"]
+                            profit = (current - buy_price) * h["shares"]
+                            state = load_dry_run_state()
+                            state["balance"] = state["balance"] + proceeds
+                            save_dry_run_state(state)
+                            log_dry_transaction("sell", event_slug=h["event_slug"], bracket=h["bracket_label"],
+                                               buy_price=buy_price, sell_price=current, shares=h["shares"],
+                                               return_x=ret, profit_usd=profit, proceeds=proceeds, balance=state["balance"])
+                            _print_sell(h["event_slug"], h["bracket_label"], current, reason)
+                            print(f"      +${proceeds:.2f}  balance=${state['balance']:.2f}")
+                    elif client:
+                        resp = place_sell_order(client, h["token_id"], current, int(h["shares"]))
+                        if resp:
+                            remove_holding(h["event_slug"], h["bracket_label"])
+                            profit = (current - buy_price) * h["shares"]
+                            log_transaction("sell", event_slug=h["event_slug"], bracket=h["bracket_label"],
+                                            buy_price=buy_price, sell_price=current, shares=h["shares"],
+                                            return_x=ret, profit_usd=profit)
+                            _print_sell(h["event_slug"], h["bracket_label"], current, reason)
+
+            if dry_run:
+                holdings = load_holdings(dry_run=True)
+                n_positions = len(set((h["event_slug"], h["bracket_label"]) for h in holdings))
 
             # --- BUY: score and place orders ---
             cooldown_h = config.get("buy_cooldown_hours", BUY_COOLDOWN_HOURS)
@@ -637,9 +788,17 @@ def run_bot():
                                     pass
 
                         if dry_run:
+                            state = load_dry_run_state()
+                            if state["balance"] < bet_usd:
+                                continue
                             shares = bet_usd / row["price"]
                             add_dry_holding(row["event_slug"], row["bracket_label"], row["price"], shares, row["token_id"])
+                            state["balance"] -= bet_usd
+                            save_dry_run_state(state)
+                            log_dry_transaction("buy", event_slug=row["event_slug"], bracket=row["bracket_label"],
+                                               price=row["price"], shares=shares, usd=bet_usd, pred=row["_pred"], balance=state["balance"])
                             _print_buy("DRY", row["event_slug"], row["bracket_label"], row["price"], pred=row["_pred"], usd=bet_usd)
+                            print(f"      -${bet_usd:.2f}  balance=${state['balance']:.2f}")
                             n_positions += 1
                             continue
 
@@ -677,6 +836,7 @@ def main():
     parser.add_argument("--bet", type=float, default=None, help="USD per trade")
     parser.add_argument("--holdings", action="store_true", help="Show holdings")
     parser.add_argument("--transactions", action="store_true", help="Show recent transactions")
+    parser.add_argument("--reset-dry", action="store_true", help="Reset dry run state (balance + holdings) and exit")
     parser.add_argument("--correlations", action="store_true", help="Print feature correlations vs max_return_all")
     parser.add_argument("--train-only", action="store_true", help="Pre-train model and exit")
     args = parser.parse_args()
@@ -701,6 +861,15 @@ def main():
         if TRANSACTIONS_PATH.exists():
             for line in open(TRANSACTIONS_PATH).readlines()[-20:]:
                 print(line.strip())
+        return
+
+    if args.reset_dry:
+        removed = []
+        for p in (DRY_RUN_STATE_PATH, DRY_RUN_HOLDINGS_PATH):
+            if p.exists():
+                p.unlink()
+                removed.append(str(p))
+        print("Reset dry run state:", removed or "(nothing to reset)")
         return
 
     if args.correlations:
