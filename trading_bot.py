@@ -500,7 +500,7 @@ def load_or_train_model() -> dict:
     else:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         print("No trained model found; fetching Polymarket data and training from scratch...")
-        df, _ = get_polymarket_data(incremental=False, force_refresh=False, verbose=False)
+        df, _ = get_polymarket_data(incremental=False, force_refresh=False, verbose=True)
         if df.empty:
             raise RuntimeError(
                 f"Polymarket data fetch returned no rows; cannot train model. "
