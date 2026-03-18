@@ -330,8 +330,8 @@ def _compute_history_features(df: pd.DataFrame) -> pd.DataFrame:
     # Pre-load all histories from cache/API (avoids slow per-row df.at[] in loop)
     step = max(1, n_rows // 10)
     for idx, row in enumerate(df.itertuples(index=False)):
-        if n_rows > 50 and (idx + 1) % step == 0:
-            print(f"    ... {idx + 1}/{n_rows} brackets", flush=True)
+        # if n_rows > 50 and (idx + 1) % step == 0:
+        #     print(f"    ... {idx + 1}/{n_rows} brackets", flush=True)
         cid = getattr(row, "condition_id", "") or ""
         token_id = getattr(row, "token_id", "") or ""
         if not cid or not token_id:
