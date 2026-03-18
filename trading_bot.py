@@ -477,25 +477,46 @@ def fetch_current_prices(events: list[dict]) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 def load_or_train_model() -> dict:
+    """
+    Load existing outcome model if present; otherwise automatically fetch data and train.
+
+    This makes the bot self-contained: on first run it will download Polymarket
+    data, build features, train the model, and persist it to MODEL_PATH.
+    """
     from pm_features import build_bracket_features, add_return_labels
-    from pm_model import TRADE_FEATURES, _dedupe_cols
 
     if MODEL_PATH.exists():
         import pickle
         with open(MODEL_PATH, "rb") as f:
             return pickle.load(f)
 
-    # Train from historical data
-    parquet = POLYMARKET_DIR / "bracket_prices.parquet"
-    if not parquet.exists():
-        raise FileNotFoundError(f"Run polymarket data fetch first. Missing {parquet}")
+    from polymarket_data import get_polymarket_data
+    from pm_outcome import train_outcome_model
 
-    df = pd.read_parquet(parquet)
+    parquet = POLYMARKET_DIR / "bracket_prices.parquet"
+
+    if parquet.exists():
+        df = pd.read_parquet(parquet)
+    else:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        print("No trained model found; fetching Polymarket data and training from scratch...")
+        df, _ = get_polymarket_data(incremental=False, force_refresh=False, verbose=False)
+        if df.empty:
+            raise RuntimeError(
+                f"Polymarket data fetch returned no rows; cannot train model. "
+                f"Check network access and try again."
+            )
+
     featured = build_bracket_features(df)
     labeled = add_return_labels(featured)
 
-    from pm_outcome import train_outcome_model
-    info = train_outcome_model(labeled, test_days=120, brackets_away_min=1.5, brackets_away_max=6.0, verbose=False)
+    info = train_outcome_model(
+        labeled,
+        test_days=120,
+        brackets_away_min=1.5,
+        brackets_away_max=6.0,
+        verbose=False,
+    )
 
     MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
     import pickle
