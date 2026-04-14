@@ -100,7 +100,9 @@ def notify(title: str, message: str):
 # ---------------------------------------------------------------------------
 
 def fetch_active_events() -> list[dict]:
-    """Get currently active Elon tweet bracket events."""
+    """Get currently active Elon tweet bracket events (weekly only, 2-day excluded)."""
+    from polymarket_data import filter_weekly_events
+
     resp = requests.get(f"{GAMMA_URL}/public-search", params={
         "q": "elon musk tweets",
         "limit_per_type": 50,
@@ -120,7 +122,7 @@ def fetch_active_events() -> list[dict]:
         if arr and isinstance(arr, list) and len(arr[0].get("markets", [])) >= 5:
             events.append(arr[0])
         time.sleep(0.3)
-    return events
+    return filter_weekly_events(events)
 
 
 def fetch_current_prices(events: list[dict]) -> pd.DataFrame:

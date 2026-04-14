@@ -1,10 +1,7 @@
-"""Trade outcome model (v2): train on ACTUAL backtest results, strict temporal split.
+"""Trade outcome model (v2): train on ACTUAL backtest results, random train/test split.
 
-Optimized for your strategy: low win rate (20-30%) but jackpots at 8-10x.
-- Target: JACKPOT POTENTIAL = max return during hold (not sell price)
-- Weighted training: high-return trades count more (find the 8-10x winners)
-- Filter: only take trades with predicted jackpot potential > 6x or 8x
-- Metric: return per trade (scale by bet size), not trade count
+Random split (not temporal) so training includes recent behavior — Elon's patterns
+change over time, so older-only training is less accurate.
 """
 
 from __future__ import annotations
@@ -12,6 +9,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import GradientBoostingRegressor, GradientBoostingClassifier
+from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_absolute_error, accuracy_score
 
 from pm_features import RETURN_CAP
@@ -20,21 +18,33 @@ from pm_model import backtest_strategy, TRADE_FEATURES, _dedupe_cols
 # Your strategy: low win rate, jackpots at 8-10x
 JACKPOT_THRESHOLD = 8.0  # 8x+ = jackpot
 
-# Train on events before this date; test only on events on/after
-DEFAULT_TEST_CUTOFF_DAYS = 120  # test on last 120 days of data
+DEFAULT_TEST_FRAC = 0.2  # 20% of events held out for test (random sample)
+DEFAULT_TEST_CUTOFF_DAYS = 120  # default backtest eval window (last N days)
+RANDOM_STATE = 42
 
 
-def _get_train_test_events(df: pd.DataFrame, test_days: int = DEFAULT_TEST_CUTOFF_DAYS):
-    """Split events by time: train = older, test = most recent test_days."""
+def _get_train_test_events(
+    df: pd.DataFrame,
+    test_frac: float = DEFAULT_TEST_FRAC,
+    random_state: int = RANDOM_STATE,
+):
+    """Split events randomly: train = 1-test_frac, test = test_frac.
+
+    Random split ensures training includes recent behavior from all time periods,
+    not just older data. More accurate for human behavior that changes gradually.
+    """
     closed = df[df["event_closed"] == True]
     if closed.empty:
         return set(), set()
 
-    events = closed.sort_values("event_start")["event_slug"].unique()
-    cutoff = closed["event_start"].max() - pd.Timedelta(days=test_days)
-    train_events = set(e for e in events if closed[closed["event_slug"] == e]["event_start"].iloc[0] < cutoff)
-    test_events = set(e for e in events if closed[closed["event_slug"] == e]["event_start"].iloc[0] >= cutoff)
-    return train_events, test_events
+    events = closed.sort_values("event_start")["event_slug"].unique().tolist()
+    if len(events) < 10:
+        return set(), set()
+
+    train_events, test_events = train_test_split(
+        events, test_size=test_frac, random_state=random_state
+    )
+    return set(train_events), set(test_events)
 
 
 def generate_trade_outcomes(
@@ -128,7 +138,7 @@ def generate_trade_outcomes(
 
 def train_outcome_model(
     df: pd.DataFrame,
-    test_days: int = DEFAULT_TEST_CUTOFF_DAYS,
+    test_frac: float = DEFAULT_TEST_FRAC,
     min_pred_threshold: float = 6.0,
     jackpot_threshold: float = JACKPOT_THRESHOLD,
     brackets_away_min: float = 2.0,
@@ -138,14 +148,15 @@ def train_outcome_model(
     """Train model to predict JACKPOT POTENTIAL (max return during hold).
 
     Optimized for: low win rate, but 8-10x jackpots. Weight high-return trades more.
+    Uses random train/test split so training includes recent behavior from all time periods.
     """
-    train_events, test_events = _get_train_test_events(df, test_days)
+    train_events, test_events = _get_train_test_events(df, test_frac=test_frac)
     if not train_events:
         raise ValueError("No train events")
 
     if verbose:
         print(f"=== Jackpot Model (target: {jackpot_threshold}x+ potential) ===")
-        print(f"  Train events: {len(train_events)}, Test: {len(test_events)} (last {test_days}d)")
+        print(f"  Train events: {len(train_events)}, Test: {len(test_events)} (random {int((1-test_frac)*100)}/{int(test_frac*100)} split)")
         print(f"  Bracket range: {brackets_away_min}-{brackets_away_max}")
 
     train_trades = generate_trade_outcomes(
@@ -190,6 +201,7 @@ def train_outcome_model(
         "jackpot_clf": clf,
         "feature_names": features,
         "test_events": test_events,
+        "test_days": None,  # random split; backtest uses requested eval window
         "train_events": train_events,
         "min_pred_threshold": min_pred_threshold,
         "jackpot_threshold": jackpot_threshold,
@@ -304,64 +316,86 @@ def backtest_outcome_filtered(
     trades_df = pd.DataFrame(trades)
     if verbose and not trades_df.empty:
         n = len(trades_df)
-        avg_ret = trades_df["return"].mean()
+        total_back = trades_df["return"].sum()
+        pnl = total_back - n
+        roi_pct = (total_back / n - 1) * 100
         win_rate = (trades_df["return"] > 1).mean() * 100
         big_wins = (trades_df["return"] >= 4).sum()
-        print(f"  Filtered: {n} trades, avg {avg_ret:.2f}x/trade, win rate {win_rate:.0f}%, {big_wins} hit 4x+")
+        print(f"  Filtered: {n} trades, bet ${n}, got ${total_back:.1f} back, P&L ${pnl:+.1f} ({roi_pct:+.0f}% ROI), {big_wins} hit 4x+")
     return trades_df
+
+
+def _filter_test_events_to_window(df: pd.DataFrame, test_events: set, eval_days: int) -> set:
+    """Restrict test_events to only those starting in the last eval_days."""
+    closed = df[df["event_closed"] == True]
+    if closed.empty:
+        return set()
+    max_start = closed["event_start"].max()
+    cutoff = max_start - pd.Timedelta(days=eval_days)
+    event_starts = closed.groupby("event_slug")["event_start"].min()
+    return {e for e in test_events if e in event_starts.index and event_starts[e] >= cutoff}
 
 
 def run_outcome_comparison(
     df: pd.DataFrame,
+    model_info: dict,
     test_days: int = DEFAULT_TEST_CUTOFF_DAYS,
     thresholds: list[float] = (4.0, 6.0, 8.0, 10.0),
     verbose: bool = True,
 ) -> dict[str, pd.DataFrame]:
-    """Compare manual vs outcome-filtered on TEST events. Includes expanded (wider brackets) variant."""
+    """Run backtest: apply loaded model to data and compare strategies.
+
+    model_info: from load_model() - never trains. Backtest only.
+    test_days: eval window (last N days). All strategies use this window.
+    """
+    outcome_expanded = model_info.copy()
+    eval_days = test_days
+    # Restrict model's test_events to the requested window
+    outcome_expanded["test_events"] = _filter_test_events_to_window(
+        df, outcome_expanded["test_events"], eval_days
+    )
+    if verbose:
+        print(f"Using loaded model (eval on {len(outcome_expanded['test_events'])} test events, {eval_days}d)")
+
     # --- Manual baseline (2-3 brackets) ---
     manual_bt = backtest_strategy(
         df, trade_model=None, strategy="manual",
         brackets_away_min=2.0, brackets_away_max=3.5,
         sell_target_x=4.5, sell_1day_left_hours=24,
-        recent_days=test_days, verbose=False,
+        recent_days=eval_days, verbose=False,
     )
     if verbose and not manual_bt.empty:
         n = len(manual_bt)
-        pnl = manual_bt["return"].sum() - n
+        total_back = manual_bt["return"].sum()
+        pnl = total_back - n  # bet $1/trade, got total_back back
+        roi_pct = (total_back / n - 1) * 100
         print(f"\n=== Manual (2-3 brackets, all trades) ===")
-        print(f"  {n} trades, P&L ${pnl:+.1f} ({(manual_bt['return'].sum()/n-1)*100:+.0f}%)")
+        print(f"  {n} trades, bet ${n}, got ${total_back:.1f} back, P&L ${pnl:+.1f} ({roi_pct:+.0f}% ROI)")
 
-    # --- Outcome model: train on 2-3 brackets ---
-    outcome_info = train_outcome_model(
-        df, test_days=test_days,
-        brackets_away_min=2.0, brackets_away_max=3.5,
-        verbose=verbose,
-    )
+    # Outcome model for 2-3 brackets: use same model with bracket filter
+    outcome_info_23 = {**outcome_expanded, "brackets_away_min": 2.0, "brackets_away_max": 3.5}
 
     results = {"manual": manual_bt}
     for thresh in thresholds:
-        filtered = backtest_outcome_filtered(df, outcome_info, pred_threshold=thresh, verbose=verbose)
+        filtered = backtest_outcome_filtered(df, outcome_info_23, pred_threshold=thresh, verbose=verbose)
         results[f"filtered_{thresh}x"] = filtered
 
-    # --- Expanded: train on 1.5-6 brackets, more opportunities ---
+    # --- Expanded: 1.5-6 brackets ---
     if verbose:
         print(f"\n--- Expanded (1.5-6 brackets, model filters) ---")
-    outcome_expanded = train_outcome_model(
-        df, test_days=test_days,
-        brackets_away_min=1.5, brackets_away_max=6.0,
-        verbose=verbose,
-    )
     # Manual expanded (all 1.5-6 bracket trades, no filter)
     manual_expanded = backtest_strategy(
         df, trade_model=None, strategy="manual",
         brackets_away_min=1.5, brackets_away_max=6.0,
         sell_target_x=4.5, sell_1day_left_hours=24,
-        recent_days=test_days, verbose=False,
+        recent_days=eval_days, verbose=False,
     )
     if verbose and not manual_expanded.empty:
         n = len(manual_expanded)
-        pnl = manual_expanded["return"].sum() - n
-        print(f"  Manual expanded (all): {n} trades, P&L ${pnl:+.1f} ({(manual_expanded['return'].sum()/n-1)*100:+.0f}%)")
+        total_back = manual_expanded["return"].sum()
+        pnl = total_back - n
+        roi_pct = (total_back / n - 1) * 100
+        print(f"  Manual expanded (all): {n} trades, bet ${n}, got ${total_back:.1f} back, P&L ${pnl:+.1f} ({roi_pct:+.0f}% ROI)")
 
     results["manual_expanded"] = manual_expanded
     for thresh in [6.0, 8.0, 10.0]:

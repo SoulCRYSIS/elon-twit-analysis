@@ -114,6 +114,25 @@ def filter_bracket_events(events: list[dict], min_markets: int = 5) -> list[dict
     return [e for e in events if len(e.get("markets", [])) >= min_markets]
 
 
+def filter_weekly_events(events: list[dict]) -> list[dict]:
+    """Keep only weekly events (duration > 72h). Excludes 2-day events with limited history."""
+    result = []
+    for e in events:
+        start_s = e.get("startDate") or ""
+        end_s = e.get("endDate") or ""
+        if not start_s or not end_s:
+            continue
+        try:
+            start = datetime.fromisoformat(start_s.replace("Z", "+00:00"))
+            end = datetime.fromisoformat(end_s.replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            continue
+        dur_hours = (end - start).total_seconds() / 3600
+        if dur_hours > 72:
+            result.append(e)
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Bracket parsing helpers
 # ---------------------------------------------------------------------------
@@ -485,11 +504,13 @@ def get_polymarket_data(
     incremental: bool = False,
     verbose: bool = True,
     min_markets: int = 5,
+    weekly_only: bool = True,
 ) -> tuple[pd.DataFrame, list[dict]]:
     """End-to-end: discover events, fetch prices, build DataFrame.
 
     If incremental=True: only fetch new events and append new price data (fast).
     Use incremental for periodic retrains; use force_refresh for full rebuild.
+    weekly_only: if True (default), exclude 2-day events. If False, include all.
     """
     events = search_elon_tweet_events(
         force_refresh=force_refresh and not incremental,
@@ -497,8 +518,12 @@ def get_polymarket_data(
         verbose=verbose,
     )
     bracket_events = filter_bracket_events(events, min_markets=min_markets)
-    if verbose:
-        print(f"{len(bracket_events)} bracket events (of {len(events)} total)", flush=True)
+    if weekly_only:
+        bracket_events = filter_weekly_events(bracket_events)
+        if verbose:
+            print(f"{len(bracket_events)} weekly bracket events (2-day excluded)", flush=True)
+    elif verbose:
+        print(f"{len(bracket_events)} bracket events (weekly + 2-day)", flush=True)
 
     if force_refresh or not PARQUET_PATH.exists() or incremental:
         fetch_all_price_histories(

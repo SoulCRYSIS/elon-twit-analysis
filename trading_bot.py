@@ -10,15 +10,34 @@ Data (persists across restarts):
   data/transactions.jsonl — buy/sell log (append-only)
   data/model_outcome.pkl  — trained model
 
-.env variables:
-  PK or PRIVATE_KEY       - Wallet private key (required)
+Configuration: set environment variables (e.g. in Railway) or in a local `.env` file.
+Railway injects env vars at runtime; `.env` is optional and does not override existing vars.
+
+  PK or PRIVATE_KEY       - Wallet private key (required for live trading)
+  DRY_RUN                 - "true" to disable real orders (PK optional if dry run)
+  DATA_DIR                - Base data directory (default: ./data); use a volume path on Railway
+  GAMMA_URL, CLOB_URL     - Polymarket APIs (defaults: gamma-api / clob hostnames)
+  CHAIN_ID                - Polygon chain id (default 137)
   BET_USD                 - USD per trade (default 1)
   MAX_POSITIONS           - Max open positions (default 20)
-  BUY_COOLDOWN_HOURS      - Hours before adding to same bracket again (default 24)
-  BUY_AGAIN_PRICE_RATIO   - Only add when price < last/this (default 3 = must be 3x lower)
+  POLL_INTERVAL           - Seconds between loop iterations (default 3600)
+  PRICE_HISTORY_HOURS     - In-memory price history window (default 48)
+  PRED_MIN                - Min model pred for buys (default 6)
+  JACKPOT_PROBA_MIN       - Min jackpot probability (default 0.01)
+  BUY_PRICE_MAX, BUY_PRICE_MIN - Candidate price band (default 0.02 / 0.001)
+  BRACKETS_AWAY_MIN, BRACKETS_AWAY_MAX (default 1.5 / 6.0)
+  BUY_MIN_HOURS_REMAINING - Min hours left on event to buy (default 24)
+  SELL_TARGET_X           - Take-profit multiple vs buy price (default 4.5)
+  SELL_1DAY_HOURS         - Force sell if less than this many hours left (default 24)
+  BUY_COOLDOWN_HOURS      - Hours before adding to same bracket again (default 4)
+  BUY_AGAIN_PRICE_RATIO   - Only add when price < last_buy / this (default 2)
   DRY_RUN_START_BALANCE   - Simulated starting $ for dry run (default 100)
-  DRY_RUN                 - Set to "true" to disable real orders
-  RETRAIN_HOURS           - Hours between data fetch + model retrain (default 24, 0=disabled)
+  RETRAIN_HOURS           - Hours between data fetch + retrain (default 72; 0=disabled)
+  EVENT_SEARCH_QUERY      - Gamma public-search query (default: elon musk tweets)
+  EVENT_SEARCH_LIMIT      - limit_per_type (default 50)
+  EVENTS_STATUS           - Gamma events_status filter (default active; empty to omit)
+  EVENT_FETCH_SLEEP_SEC   - Pause between event detail fetches (default 0.2)
+  CLOB_HTTP_TIMEOUT       - Seconds for CLOB HTTP requests (default 10)
 """
 
 from __future__ import annotations
@@ -36,9 +55,34 @@ import pandas as pd
 import requests
 from dotenv import load_dotenv
 
-# Paths (all under data/ for persistence across restarts)
-ROOT = Path(__file__).parent
-DATA_DIR = ROOT / "data"
+ROOT = Path(__file__).parent.resolve()
+load_dotenv(ROOT / ".env")
+
+
+def _env_str(key: str, default: str) -> str:
+    v = os.getenv(key)
+    if v is None or not str(v).strip():
+        return default
+    return str(v).strip()
+
+
+def _env_int(key: str, default: int) -> int:
+    v = os.getenv(key)
+    if v is None or not str(v).strip():
+        return default
+    return int(v)
+
+
+def _env_float(key: str, default: float) -> float:
+    v = os.getenv(key)
+    if v is None or not str(v).strip():
+        return default
+    return float(v)
+
+
+# Paths (under DATA_DIR; set DATA_DIR for Railway volumes)
+_data_env = os.getenv("DATA_DIR", "").strip()
+DATA_DIR = Path(_data_env).expanduser().resolve() if _data_env else ROOT / "data"
 POLYMARKET_DIR = DATA_DIR / "polymarket"
 HOLDINGS_PATH = DATA_DIR / "holdings.json"  # Positions — loaded on bot restart (real mode only)
 DRY_RUN_HOLDINGS_PATH = DATA_DIR / "dry_run_holdings.json"  # Simulated positions when --dry-run
@@ -47,22 +91,24 @@ DRY_RUN_TRANSACTIONS_PATH = DATA_DIR / "dry_run_transactions.jsonl"  # Simulated
 TRANSACTIONS_PATH = DATA_DIR / "transactions.jsonl"  # Buy/sell log
 MODEL_PATH = DATA_DIR / "model_outcome.pkl"
 
-GAMMA_URL = "https://gamma-api.polymarket.com"
-CLOB_URL = "https://clob.polymarket.com"
-CHAIN_ID = 137
+GAMMA_URL = _env_str("GAMMA_URL", "https://gamma-api.polymarket.com").rstrip("/")
+CLOB_URL = _env_str("CLOB_URL", "https://clob.polymarket.com").rstrip("/")
+CHAIN_ID = _env_int("CHAIN_ID", 137)
 
-POLL_INTERVAL = 600  # 15 min
-MAX_OPEN_POSITIONS = 10
+MAX_OPEN_POSITIONS = 20
 DEFAULT_BET_USD = 1.0
-PRICE_HISTORY_HOURS = 48  # Keep 48h in memory for momentum/volatility features
-PRED_THRESHOLD = 6.0  # Min predicted jackpot potential; set PRED_MIN in .env
+PRED_THRESHOLD = 6.0  # Min predicted jackpot potential; set PRED_MIN in env
 JACKPOT_PROBA_THRESHOLD = 0.01  # Min P(jackpot); classifier is conservative on live (no history)
-SELL_TARGET_X = 4.5
-SELL_1DAY_HOURS = 24
 BUY_COOLDOWN_HOURS = 4  # Don't add to same bracket within this many hours
 BUY_AGAIN_PRICE_RATIO = 2.0  # Only add when price < last_buy_price / this (averaging down)
 DRY_RUN_START_BALANCE = 100.0  # Simulated starting balance for performance testing
-RETRAIN_HOURS = 24.0  # Hours between data fetch + retrain; 0 = disabled
+RETRAIN_HOURS = 72.0  # Hours between data fetch + retrain; 0 = disabled
+
+EVENT_SEARCH_QUERY = _env_str("EVENT_SEARCH_QUERY", "elon musk tweets")
+EVENT_SEARCH_LIMIT = _env_int("EVENT_SEARCH_LIMIT", 50)
+EVENTS_STATUS = _env_str("EVENTS_STATUS", "active")
+EVENT_FETCH_SLEEP_SEC = _env_float("EVENT_FETCH_SLEEP_SEC", 0.2)
+CLOB_HTTP_TIMEOUT = _env_float("CLOB_HTTP_TIMEOUT", 10.0)
 
 RETRAIN_STATE_PATH = DATA_DIR / "retrain_state.json"
 
@@ -72,20 +118,29 @@ RETRAIN_STATE_PATH = DATA_DIR / "retrain_state.json"
 # ---------------------------------------------------------------------------
 
 def load_config() -> dict:
-    load_dotenv(ROOT / ".env")
-    pk = os.getenv("PK") or os.getenv("PRIVATE_KEY")
-    if not pk:
-        raise ValueError("Missing PK or PRIVATE_KEY in .env")
+    dry = os.getenv("DRY_RUN", "false").lower() == "true"
+    pk = (os.getenv("PK") or os.getenv("PRIVATE_KEY") or "").strip()
+    if not dry and not pk:
+        raise ValueError("Missing PK or PRIVATE_KEY (required unless DRY_RUN=true)")
     return {
-        "private_key": pk.strip(),
-        "bet_usd": float(os.getenv("BET_USD", DEFAULT_BET_USD)),
-        "max_positions": int(os.getenv("MAX_POSITIONS", MAX_OPEN_POSITIONS)),
-        "dry_run": os.getenv("DRY_RUN", "false").lower() == "true",
-        "pred_min": float(os.getenv("PRED_MIN", PRED_THRESHOLD)),
-        "proba_min": float(os.getenv("JACKPOT_PROBA_MIN", JACKPOT_PROBA_THRESHOLD)),
-        "buy_cooldown_hours": float(os.getenv("BUY_COOLDOWN_HOURS", BUY_COOLDOWN_HOURS)),
-        "buy_again_price_ratio": float(os.getenv("BUY_AGAIN_PRICE_RATIO", BUY_AGAIN_PRICE_RATIO)),
-        "dry_run_start_balance": float(os.getenv("DRY_RUN_START_BALANCE", DRY_RUN_START_BALANCE)),
+        "private_key": pk,
+        "bet_usd": _env_float("BET_USD", DEFAULT_BET_USD),
+        "max_positions": _env_int("MAX_POSITIONS", MAX_OPEN_POSITIONS),
+        "dry_run": dry,
+        "pred_min": _env_float("PRED_MIN", PRED_THRESHOLD),
+        "proba_min": _env_float("JACKPOT_PROBA_MIN", JACKPOT_PROBA_THRESHOLD),
+        "buy_cooldown_hours": _env_float("BUY_COOLDOWN_HOURS", BUY_COOLDOWN_HOURS),
+        "buy_again_price_ratio": _env_float("BUY_AGAIN_PRICE_RATIO", BUY_AGAIN_PRICE_RATIO),
+        "dry_run_start_balance": _env_float("DRY_RUN_START_BALANCE", DRY_RUN_START_BALANCE),
+        "poll_interval": _env_int("POLL_INTERVAL", 3600),
+        "price_history_hours": _env_int("PRICE_HISTORY_HOURS", 48),
+        "sell_target_x": _env_float("SELL_TARGET_X", 4.5),
+        "sell_1day_hours": _env_float("SELL_1DAY_HOURS", 24.0),
+        "buy_price_max": _env_float("BUY_PRICE_MAX", 0.02),
+        "buy_price_min": _env_float("BUY_PRICE_MIN", 0.001),
+        "brackets_away_min": _env_float("BRACKETS_AWAY_MIN", 1.5),
+        "brackets_away_max": _env_float("BRACKETS_AWAY_MAX", 6.0),
+        "buy_min_hours_remaining": _env_float("BUY_MIN_HOURS_REMAINING", 24.0),
     }
 
 
@@ -265,10 +320,10 @@ def log_transaction(action: str, **kwargs):
 _price_history: dict[str, list[tuple[int, float]]] = {}  # condition_id -> [(ts, price), ...]
 
 
-def _append_prices_to_history(df: pd.DataFrame):
-    """Append current prices to in-memory history. Prune to PRICE_HISTORY_HOURS."""
+def _append_prices_to_history(df: pd.DataFrame, max_hours: int):
+    """Append current prices to in-memory history. Prune to max_hours."""
     now_ts = int(datetime.now(timezone.utc).timestamp())
-    cutoff = now_ts - PRICE_HISTORY_HOURS * 3600
+    cutoff = now_ts - max_hours * 3600
     for _, row in df.iterrows():
         cid = row.get("condition_id", "")
         if not cid:
@@ -306,7 +361,7 @@ def _load_history_from_cache_or_api(condition_id: str, token_id: str) -> tuple[l
             f"{CLOB_URL}/prices-history",
             params={"market": token_id, "startTs": start_ts, "endTs": now_ts, "fidelity": 60},
             headers={"Accept": "application/json"},
-            timeout=10,
+            timeout=CLOB_HTTP_TIMEOUT,
         )
         resp.raise_for_status()
         pts = resp.json().get("history", [])
@@ -413,11 +468,15 @@ def _compute_history_features(df: pd.DataFrame) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 def fetch_active_events() -> list[dict]:
-    resp = requests.get(f"{GAMMA_URL}/public-search", params={
-        "q": "elon musk tweets",
-        "limit_per_type": 50,
-        "events_status": "active",
-    })
+    from polymarket_data import filter_weekly_events
+
+    params: dict = {
+        "q": EVENT_SEARCH_QUERY,
+        "limit_per_type": EVENT_SEARCH_LIMIT,
+    }
+    if EVENTS_STATUS:
+        params["events_status"] = EVENTS_STATUS
+    resp = requests.get(f"{GAMMA_URL}/public-search", params=params)
     resp.raise_for_status()
     stubs = resp.json().get("events", [])
 
@@ -431,11 +490,11 @@ def fetch_active_events() -> list[dict]:
         arr = resp2.json()
         if arr and isinstance(arr, list) and len(arr[0].get("markets", [])) >= 5:
             events.append(arr[0])
-        time.sleep(0.2)
-    return events
+        time.sleep(EVENT_FETCH_SLEEP_SEC)
+    return filter_weekly_events(events)
 
 
-def fetch_current_prices(events: list[dict]) -> pd.DataFrame:
+def fetch_current_prices(events: list[dict], *, price_history_hours: int = 48) -> pd.DataFrame:
     from polymarket_data import parse_bracket
 
     rows = []
@@ -505,7 +564,7 @@ def fetch_current_prices(events: list[dict]) -> pd.DataFrame:
     df["leading_bracket_price"] = grp["price"].transform("max")
 
     df = _compute_history_features(df)
-    _append_prices_to_history(df)
+    _append_prices_to_history(df, price_history_hours)
 
     event_dur = (df["event_end"] - df["event_start"]).dt.total_seconds() / 3600
     event_dur = event_dur.replace(0, 1)
@@ -527,20 +586,29 @@ def load_or_train_model() -> dict:
     This makes the bot self-contained: on first run it will download Polymarket
     data, build features, train the model, and persist it to MODEL_PATH.
     """
+    from polymarket_data import get_polymarket_data
     from pm_features import build_bracket_features, add_return_labels
+    from pm_outcome import train_outcome_model
 
     if MODEL_PATH.exists():
         import pickle
         with open(MODEL_PATH, "rb") as f:
             return pickle.load(f)
 
-    from polymarket_data import get_polymarket_data
-    from pm_outcome import train_outcome_model
-
     parquet = POLYMARKET_DIR / "bracket_prices.parquet"
 
     if parquet.exists():
         df = pd.read_parquet(parquet)
+        # Filter to weekly events only (exclude 2-day with limited history)
+        df["event_start"] = pd.to_datetime(df["event_start"], utc=True)
+        df["event_end"] = pd.to_datetime(df["event_end"], utc=True)
+        dur_hours = (df["event_end"] - df["event_start"]).dt.total_seconds() / 3600
+        df = df[dur_hours > 72].copy()
+        if df.empty:
+            print("Parquet had only 2-day events; fetching fresh data...")
+            df, _ = get_polymarket_data(incremental=False, force_refresh=False, verbose=True)
+            if df.empty:
+                raise RuntimeError("No weekly events found; cannot train model.")
     else:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         print("No trained model found; fetching Polymarket data and training from scratch...")
@@ -556,7 +624,7 @@ def load_or_train_model() -> dict:
 
     info = train_outcome_model(
         labeled,
-        test_days=120,
+        test_frac=0.2,
         brackets_away_min=1.5,
         brackets_away_max=6.0,
         verbose=True,
@@ -609,7 +677,7 @@ def refresh_data_and_retrain() -> dict | None:
         print("  Building features and retraining...")
         featured = build_bracket_features(df)
         labeled = add_return_labels(featured)
-        info = train_outcome_model(labeled, test_days=120, brackets_away_min=1.5, brackets_away_max=6.0, verbose=True)
+        info = train_outcome_model(labeled, test_frac=0.2, brackets_away_min=1.5, brackets_away_max=6.0, verbose=True)
 
         import pickle
         with open(MODEL_PATH, "wb") as f:
@@ -646,24 +714,39 @@ def score_candidates(
     pred_min: float = None,
     proba_min: float = None,
     *,
+    filters: dict | None = None,
     verbose: bool = True,
 ) -> pd.DataFrame:
     """Score brackets for buy; return those passing pred and proba thresholds."""
+    f = {
+        "buy_price_max": 0.02,
+        "buy_price_min": 0.001,
+        "brackets_away_min": 1.5,
+        "brackets_away_max": 6.0,
+        "buy_min_hours_remaining": 24.0,
+    }
+    if filters:
+        f.update({k: filters[k] for k in f if k in filters})
     mask = (
-        (df["price"] < 0.02) & (df["price"] > 0.001) &
-        (df["brackets_away"] >= 1.5) & (df["brackets_away"] <= 6.0) &
-        (df["hours_remaining"] > 24)
+        (df["price"] < f["buy_price_max"]) & (df["price"] > f["buy_price_min"]) &
+        (df["brackets_away"] >= f["brackets_away_min"]) & (df["brackets_away"] <= f["brackets_away_max"]) &
+        (df["hours_remaining"] > f["buy_min_hours_remaining"])
     )
     candidates = df[mask].copy()
 
     if candidates.empty:
         if verbose:
             n_total = len(df)
-            n_price = ((df["price"] < 0.02) & (df["price"] > 0.001)).sum()
-            n_brackets = ((df["brackets_away"] >= 1.5) & (df["brackets_away"] <= 6.0)).sum()
-            n_hrs = (df["hours_remaining"] > 24).sum()
-            print(f"  No pre-filter candidates: {n_total} brackets total, {n_price} in price range, "
-                  f"{n_brackets} in bracket range, {n_hrs} with >24h left", flush=True)
+            n_price = ((df["price"] < f["buy_price_max"]) & (df["price"] > f["buy_price_min"])).sum()
+            n_brackets = (
+                (df["brackets_away"] >= f["brackets_away_min"]) & (df["brackets_away"] <= f["brackets_away_max"])
+            ).sum()
+            n_hrs = (df["hours_remaining"] > f["buy_min_hours_remaining"]).sum()
+            print(
+                f"  No pre-filter candidates: {n_total} brackets total, {n_price} in price range, "
+                f"{n_brackets} in bracket range, {n_hrs} with >{f['buy_min_hours_remaining']}h left",
+                flush=True,
+            )
         return candidates
 
     features = model_info["feature_names"]
@@ -770,7 +853,10 @@ def run_bot():
         print(f"Transactions: {DRY_RUN_TRANSACTIONS_PATH}")
 
     retrain_h = float(os.getenv("RETRAIN_HOURS", RETRAIN_HOURS))
-    print(f"Config: bet=${config['bet_usd']}, max_positions={config['max_positions']}, poll={POLL_INTERVAL}s, retrain_every={retrain_h}h")
+    print(
+        f"Config: bet=${config['bet_usd']}, max_positions={config['max_positions']}, "
+        f"poll={config['poll_interval']}s, data_dir={DATA_DIR}, retrain_every={retrain_h}h"
+    )
     holdings = load_holdings(dry_run=dry_run)
     holdings_path = DRY_RUN_HOLDINGS_PATH if dry_run else HOLDINGS_PATH
     print(f"Holdings ({holdings_path}):")
@@ -786,8 +872,10 @@ def run_bot():
     print("Press Ctrl+C to stop.\n")
 
     while True:
+        poll_sec = config.get("poll_interval", 3600)
         try:
             config = load_config()
+            poll_sec = config["poll_interval"]
             now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
             print(f"[{now}] Checking...")
 
@@ -801,14 +889,14 @@ def run_bot():
             events = fetch_active_events()
             if not events:
                 print("  No active events")
-                time.sleep(POLL_INTERVAL)
+                time.sleep(poll_sec)
                 continue
 
             print(f"  Found {len(events)} active events, fetching prices...", flush=True)
-            df = fetch_current_prices(events)
+            df = fetch_current_prices(events, price_history_hours=config["price_history_hours"])
             if df.empty:
                 print("  No price data")
-                time.sleep(POLL_INTERVAL)
+                time.sleep(poll_sec)
                 continue
 
             holdings = load_holdings(dry_run=dry_run)
@@ -829,10 +917,10 @@ def run_bot():
 
                 should_sell = False
                 reason = ""
-                if ret >= SELL_TARGET_X:
+                if ret >= config["sell_target_x"]:
                     should_sell = True
                     reason = f"target {ret:.1f}x"
-                elif hrs_left < SELL_1DAY_HOURS:
+                elif hrs_left < config["sell_1day_hours"]:
                     should_sell = True
                     reason = f"1 day left ({ret:.1f}x)"
 
@@ -870,7 +958,16 @@ def run_bot():
             if n_positions >= max_pos:
                 print(f"  At max positions ({n_positions}/{max_pos}), skipping buy scan", flush=True)
             else:
-                scored = score_candidates(df, model_info, config.get("pred_min"), config.get("proba_min"))
+                filt = {
+                    "buy_price_max": config["buy_price_max"],
+                    "buy_price_min": config["buy_price_min"],
+                    "brackets_away_min": config["brackets_away_min"],
+                    "brackets_away_max": config["brackets_away_max"],
+                    "buy_min_hours_remaining": config["buy_min_hours_remaining"],
+                }
+                scored = score_candidates(
+                    df, model_info, config.get("pred_min"), config.get("proba_min"), filters=filt
+                )
                 if scored.empty:
                     print("  No buy candidates (price/pred/proba filters)", flush=True)
                 else:
@@ -929,7 +1026,114 @@ def run_bot():
             import traceback
             traceback.print_exc()
 
-        time.sleep(POLL_INTERVAL)
+        time.sleep(poll_sec)
+
+
+# ---------------------------------------------------------------------------
+# Backtest
+# ---------------------------------------------------------------------------
+
+def _load_model() -> dict:
+    """Load model from disk. Fails if not found. No training."""
+    if not MODEL_PATH.exists():
+        raise FileNotFoundError(
+            f"No model at {MODEL_PATH}. Run: python trading_bot.py --train-only"
+        )
+    import pickle
+    with open(MODEL_PATH, "rb") as f:
+        return pickle.load(f)
+
+
+def _run_backtest(test_days: int = 120, include_2day: bool = False, verbose: bool = True):
+    """Load model and data, run backtest. Never trains."""
+    from polymarket_data import get_polymarket_data
+    from pm_features import build_bracket_features, add_return_labels
+    from pm_outcome import run_outcome_comparison
+
+    model_info = _load_model()
+
+    parquet = POLYMARKET_DIR / "bracket_prices.parquet"
+    if include_2day:
+        print("Fetching Polymarket data (weekly + 2-day)...")
+        df, _ = get_polymarket_data(incremental=parquet.exists(), force_refresh=False, verbose=True, weekly_only=False)
+    elif parquet.exists():
+        df = pd.read_parquet(parquet)
+        df["event_start"] = pd.to_datetime(df["event_start"], utc=True)
+        df["event_end"] = pd.to_datetime(df["event_end"], utc=True)
+        dur_hours = (df["event_end"] - df["event_start"]).dt.total_seconds() / 3600
+        df = df[dur_hours > 72].copy()
+        if df.empty:
+            print("Parquet had only 2-day events; fetching fresh data...")
+            df, _ = get_polymarket_data(incremental=False, force_refresh=False, verbose=True)
+    else:
+        print("Fetching Polymarket data...")
+        df, _ = get_polymarket_data(incremental=False, force_refresh=False, verbose=True)
+
+    if df.empty:
+        print("No data; cannot run backtest.")
+        return None
+
+    period_label = "weekly + 2-day" if include_2day else "weekly only"
+    if verbose:
+        print(f"\n=== Backtest (model from {MODEL_PATH}, {period_label}) ===\n")
+    featured = build_bracket_features(df)
+    labeled = add_return_labels(featured)
+
+    results = run_outcome_comparison(labeled, model_info=model_info, test_days=test_days, verbose=verbose)
+    return results
+
+
+def _run_backtest_compare(test_days: int = 120):
+    """Run backtest for both weekly-only and weekly+2-day, print side-by-side comparison."""
+    try:
+        print("Running backtest: WEEKLY ONLY (current default)...")
+        results_weekly = _run_backtest(test_days=test_days, include_2day=False, verbose=False)
+    except FileNotFoundError as e:
+        print(str(e))
+        return
+    if results_weekly is None:
+        return
+
+    try:
+        print("\nRunning backtest: WEEKLY + 2-DAY (previous)...")
+        results_all = _run_backtest(test_days=test_days, include_2day=True, verbose=False)
+    except FileNotFoundError as e:
+        print(str(e))
+        return
+    if results_all is None:
+        return
+
+    def _summarize(results):
+        out = {}
+        for name, trades in results.items():
+            if trades.empty:
+                out[name] = {"n": 0, "pnl": 0, "ret_pct": 0, "win": 0, "big": 0, "total_back": 0}
+            else:
+                n = len(trades)
+                total_back = trades["return"].sum()
+                pnl = total_back - n  # bet $1/trade
+                ret_pct = (total_back / n - 1) * 100
+                win = (trades["return"] > 1).mean() * 100
+                big = (trades["return"] >= 4).sum()
+                out[name] = {"n": n, "pnl": pnl, "ret_pct": ret_pct, "win": win, "big": big, "total_back": total_back}
+        return out
+
+    s_weekly = _summarize(results_weekly)
+    s_all = _summarize(results_all)
+
+    print("\n" + "=" * 90)
+    print(f"COMPARISON: Weekly-only vs Weekly+2-day ({test_days}-day window)")
+    print("=" * 90)
+    print(f"{'Strategy':<32} {'Weekly only':<28} {'Weekly+2day':<28}")
+    print("-" * 90)
+
+    all_names = sorted(set(s_weekly) | set(s_all))
+    for name in all_names:
+        w = s_weekly.get(name, {})
+        a = s_all.get(name, {})
+        w_str = f"{w.get('n',0):3d} trades  bet ${w.get('n',0)} got ${w.get('total_back',0):.1f}  P&L ${w.get('pnl',0):+.1f} ({w.get('ret_pct',0):+.0f}% ROI)"
+        a_str = f"{a.get('n',0):3d} trades  bet ${a.get('n',0)} got ${a.get('total_back',0):.1f}  P&L ${a.get('pnl',0):+.1f} ({a.get('ret_pct',0):+.0f}% ROI)"
+        print(f"  {name:<30} {w_str:<28} {a_str:<28}")
 
 
 # ---------------------------------------------------------------------------
@@ -945,7 +1149,36 @@ def main():
     parser.add_argument("--reset-dry", action="store_true", help="Reset dry run state (balance + holdings) and exit")
     parser.add_argument("--correlations", action="store_true", help="Print feature correlations vs max_return_all")
     parser.add_argument("--train-only", action="store_true", help="Pre-train model and exit")
+    parser.add_argument("--backtest", type=int, nargs="?", const=120, metavar="DAYS", help="Run 120-day backtest (default: 120)")
+    parser.add_argument("--compare", type=int, nargs="?", const=120, metavar="DAYS", help="Compare weekly-only vs weekly+2day backtest (default: 120)")
     args = parser.parse_args()
+
+    if args.compare is not None:
+        _run_backtest_compare(test_days=args.compare)
+        return
+
+    if args.backtest is not None:
+        try:
+            results = _run_backtest(test_days=args.backtest, verbose=True)
+        except FileNotFoundError as e:
+            print(str(e))
+            return
+        if results:
+            print("\n" + "=" * 60)
+            print("SUMMARY")
+            print("=" * 60)
+            for name, trades in results.items():
+                if trades.empty:
+                    print(f"  {name:30s}  (no trades)")
+                else:
+                    n = len(trades)
+                    total_back = trades["return"].sum()
+                    pnl = total_back - n
+                    ret_pct = (total_back / n - 1) * 100
+                    win = (trades["return"] > 1).mean() * 100
+                    big = (trades["return"] >= 4).sum()
+                    print(f"  {name:30s}  {n:3d} trades  bet ${n} got ${total_back:.1f}  P&L ${pnl:+.1f} ({ret_pct:+.0f}% ROI)  {big} hit 4x+")
+        return
 
     if args.train_only:
         print("Training model...")

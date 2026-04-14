@@ -1,0 +1,10 @@
+# Railway: https://docs.railway.com/guides/config-as-code
+# Set variables in the project dashboard (Variables tab). See .env.example for names.
+
+[build]
+builder = "nixpacks"
+
+[deploy]
+startCommand = "python trading_bot.py"
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 10
