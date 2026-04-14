@@ -789,7 +789,7 @@ def score_candidates(
 
 
 def place_buy_order(client, token_id: str, price: float, usd_amount: float, tick_size: str = "0.01") -> dict | None:
-    from py_clob_client.clob_types import OrderArgs, OrderType
+    from py_clob_client.clob_types import OrderArgs, PartialCreateOrderOptions
     from py_clob_client.order_builder.constants import BUY
 
     size = int(usd_amount / price) if price > 0 else 0
@@ -797,10 +797,10 @@ def place_buy_order(client, token_id: str, price: float, usd_amount: float, tick
         return None
 
     try:
+        opts = PartialCreateOrderOptions(tick_size=tick_size, neg_risk=True)
         resp = client.create_and_post_order(
-            OrderArgs(token_id=token_id, price=round(price, 2), size=size, side=BUY),
-            options={"tick_size": tick_size, "neg_risk": True},
-            order_type=OrderType.GTC,
+            OrderArgs(token_id=token_id, price=round(price, 2), size=float(size), side=BUY),
+            opts,
         )
         return resp
     except Exception as e:
@@ -809,17 +809,17 @@ def place_buy_order(client, token_id: str, price: float, usd_amount: float, tick
 
 
 def place_sell_order(client, token_id: str, price: float, size: int, tick_size: str = "0.01") -> dict | None:
-    from py_clob_client.clob_types import OrderArgs, OrderType
+    from py_clob_client.clob_types import OrderArgs, PartialCreateOrderOptions
     from py_clob_client.order_builder.constants import SELL
 
     if size < 1:
         return None
 
     try:
+        opts = PartialCreateOrderOptions(tick_size=tick_size, neg_risk=True)
         resp = client.create_and_post_order(
-            OrderArgs(token_id=token_id, price=round(price, 2), size=size, side=SELL),
-            options={"tick_size": tick_size, "neg_risk": True},
-            order_type=OrderType.GTC,
+            OrderArgs(token_id=token_id, price=round(price, 2), size=float(size), side=SELL),
+            opts,
         )
         return resp
     except Exception as e:
