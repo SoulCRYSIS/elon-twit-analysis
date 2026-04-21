@@ -1,0 +1,5 @@
+[processes]
+  bot = "python trading_bot.py"
+
+[[services]]
+  processes = ["bot"]
