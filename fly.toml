@@ -1,5 +1,14 @@
+# Create the app first: `fly apps create <name>` then set `app` here, or run
+# `fly launch --no-deploy` from this directory and merge the `app` line it generates.
+app = "elon-twit"
+
+primary_region = "nrt"
+
+[build]
+  dockerfile = "Dockerfile"
+
+# Long-running bot: no [http_service] / [[services]] — those are for apps that
+# accept traffic on a port from Fly Proxy. An incomplete [[services]] block fails validation.
+
 [processes]
   bot = "python trading_bot.py"
-
-[[services]]
-  processes = ["bot"]
