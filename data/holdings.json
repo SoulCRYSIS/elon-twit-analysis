@@ -1,0 +1,110 @@
+[
+  {
+    "event_slug": "elon-musk-of-tweets-april-24-may-1",
+    "bracket_label": "380-399",
+    "buy_price": 0.0115,
+    "shares": 86.95652173913044,
+    "token_id": "108999922037355408421279010131895904990651229333097917141110176025168489862576",
+    "order_id": "0x4fd5c10f192e3f0f44377f497ec69d0d79bdbe95bc0a3dcae01ed79e5f1b8c7c",
+    "buy_time": "2026-04-21T09:09:13.648563+00:00"
+  },
+  {
+    "event_slug": "elon-musk-of-tweets-april-23-april-25",
+    "bracket_label": "215-239",
+    "buy_price": 0.0015,
+    "shares": 666.6666666666666,
+    "token_id": "107634046511665936853876964889708159946949325213250057089733702546285410664710",
+    "order_id": "0x39cce6cd4ba45ddf31c3a8b8fb0c9267a194f255414223c3796dfbefb7bdaf8a",
+    "buy_time": "2026-04-21T09:09:16.369298+00:00"
+  },
+  {
+    "event_slug": "elon-musk-of-tweets-april-24-may-1",
+    "bracket_label": "400-419",
+    "buy_price": 0.0065,
+    "shares": 153.84615384615384,
+    "token_id": "99691042511928227748528425940756879362770630185678931179898763824284797713160",
+    "order_id": "0x801d9317f0b5628c9f68f6036e9de432537cc9668f8ead29f03f4f020fd2026f",
+    "buy_time": "2026-04-21T09:09:19.083016+00:00"
+  },
+  {
+    "event_slug": "elon-musk-of-tweets-april-24-may-1",
+    "bracket_label": "140-159",
+    "buy_price": 0.0045,
+    "shares": 222.22222222222223,
+    "token_id": "780119919864943280456889996924660516314417026794085840921077404976214066828",
+    "order_id": "0xca3da6af09b4675832adf6ffff0b51b70d599843d741719f6fa6197743e7c544",
+    "buy_time": "2026-04-21T09:09:21.786312+00:00"
+  },
+  {
+    "event_slug": "elon-musk-of-tweets-april-21-april-28",
+    "bracket_label": "160-179",
+    "buy_price": 0.0105,
+    "shares": 95.23809523809523,
+    "token_id": "16661519050616278373776977471908795222219118921193713622735935303540649601129",
+    "order_id": "0x6fce06604faba0f326efe229ed1fcfab1f71349f09280d5d7bfc42e3adf70b11",
+    "buy_time": "2026-04-21T09:09:25.253732+00:00"
+  },
+  {
+    "event_slug": "elon-musk-of-tweets-april-21-april-28",
+    "bracket_label": "120-139",
+    "buy_price": 0.0045,
+    "shares": 222.22222222222223,
+    "token_id": "48126546813170185736823347328472337931192387084606846885139970909358101666994",
+    "order_id": "0xa14741beb538504b844eb330081cd9c63c7ae4c3b2b61e7a652548367a38bc96",
+    "buy_time": "2026-04-21T09:09:29.041302+00:00"
+  },
+  {
+    "event_slug": "elon-musk-of-tweets-april-17-april-24",
+    "bracket_label": "320-339",
+    "buy_price": 0.0135,
+    "shares": 74.07407407407408,
+    "token_id": "32415877469095658393287932255001044946744121340683671861784967707385128410054",
+    "order_id": "0xae2582d8ae5999f8676344d57c52365a1f6ff787d6594696cd009bf200459cb4",
+    "buy_time": "2026-04-21T09:09:31.789528+00:00"
+  },
+  {
+    "event_slug": "elon-musk-of-tweets-april-24-may-1",
+    "bracket_label": "160-179",
+    "buy_price": 0.006,
+    "shares": 168.33333333333334,
+    "token_id": "28422911629146569708232080034637871998461845317817481483990994635093034860321",
+    "order_id": "0xad4c631f5d5453ef4223c4c987d12457a978bd201e74b43ff869659358253b58",
+    "buy_time": "2026-04-21T09:35:50.788880+00:00"
+  },
+  {
+    "event_slug": "elon-musk-of-tweets-april-20-april-22",
+    "bracket_label": "140-164",
+    "buy_price": 0.004,
+    "shares": 252.5,
+    "token_id": "93811576672687106068865022595190587467219410977512817191092183615524886667059",
+    "order_id": "0x0ccd97ce0587c149c42de7ed6025c9c51fd7d33f2fa387e6543736bc213f335c",
+    "buy_time": "2026-04-21T09:35:54.447912+00:00"
+  },
+  {
+    "event_slug": "elon-musk-of-tweets-april-20-april-22",
+    "bracket_label": "115-139",
+    "buy_price": 0.008,
+    "shares": 126.25,
+    "token_id": "56991975336473403912630219795484118886648444977525140337913633916661459138626",
+    "order_id": "0x525ac712fb8553d82acfbcfef50b46cc0dcfae48a6bbfc6ed808b4dee92a3518",
+    "buy_time": "2026-04-21T09:35:58.010210+00:00"
+  },
+  {
+    "event_slug": "elon-musk-of-tweets-april-17-april-24",
+    "bracket_label": "360-379",
+    "buy_price": 0.003,
+    "shares": 336.6666666666667,
+    "token_id": "52910098718828284476638235951214205841261056536171405225200021758063907660194",
+    "order_id": "0x15775abcd77c39a14e19265d7bb930d86328d006afa12cc4da907eab2384da53",
+    "buy_time": "2026-04-21T09:36:01.559720+00:00"
+  },
+  {
+    "event_slug": "elon-musk-of-tweets-april-17-april-24",
+    "bracket_label": "340-359",
+    "buy_price": 0.007,
+    "shares": 144.28571428571428,
+    "token_id": "74121516033538536712876935422964001534096968444153840352472501923161269698988",
+    "order_id": "0xf72e30dad1f072ce6cde00f6aef7545a5f5cec9b8006312d8d1d10b894142857",
+    "buy_time": "2026-04-21T09:36:05.578634+00:00"
+  }
+]

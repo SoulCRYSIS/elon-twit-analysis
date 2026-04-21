@@ -38,16 +38,28 @@ Railway injects env vars at runtime; `.env` is optional and does not override ex
   EVENTS_STATUS           - Gamma events_status filter (default active; empty to omit)
   EVENT_FETCH_SLEEP_SEC   - Pause between event detail fetches (default 0.2)
   CLOB_HTTP_TIMEOUT       - Seconds for CLOB HTTP requests (default 10)
+  BUY_MARKET_MAX_PRICE_DIFF - If CLOB BUY price vs snapshot price differs by at most this (0–1 scale), submit a
+                              market (FOK) buy so it fills; else a limit order (default 0.1)
+  BUY_MARKET_MIN_USD      - Minimum USD notional for market buys (default 1.01; API rejects under about $1)
+  POLYMARKET_SIGNATURE_TYPE - CLOB signing: 0=EOA (MetaMask key is the trading wallet, no proxy). 1=POLY_PROXY
+                              (Magic / email login — PK exported from Polymarket). 2=POLY_GNOSIS_SAFE (most browser
+                              wallets: MetaMask/Rabby connected to Polymarket — use this if you did NOT sign up with
+                              email alone). Wrong type → API returns invalid_signature even with the right funder.
+  POLYMARKET_FUNDER       - 0x proxy wallet that holds your Polymarket balance (NOT the relayer, NOT a random
+                            contract). Polymarket docs: the address shown in the site UI / profile as *your* wallet
+                            is usually this proxy. Must pair with the PK Polymarket gave you for that account.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 import time
 from datetime import datetime, timezone
+from decimal import Decimal, ROUND_DOWN
 from pathlib import Path
 
 import numpy as np
@@ -141,6 +153,8 @@ def load_config() -> dict:
         "brackets_away_min": _env_float("BRACKETS_AWAY_MIN", 1.5),
         "brackets_away_max": _env_float("BRACKETS_AWAY_MAX", 6.0),
         "buy_min_hours_remaining": _env_float("BUY_MIN_HOURS_REMAINING", 24.0),
+        "buy_market_max_price_diff": _env_float("BUY_MARKET_MAX_PRICE_DIFF", 0.1),
+        "buy_market_min_usd": _env_float("BUY_MARKET_MIN_USD", 1.01),
     }
 
 
@@ -148,16 +162,85 @@ def load_config() -> dict:
 # Polymarket client
 # ---------------------------------------------------------------------------
 
+def _clob_signature_and_funder() -> tuple[int | None, str | None]:
+    """Parse POLYMARKET_SIGNATURE_TYPE and POLYMARKET_FUNDER for ClobClient.
+
+    Polymarket email / Magic Link accounts usually hold trading USDC in a **proxy wallet** (POLY_PROXY).
+    The bot's default is EOA-only: orders attribute collateral to the signer address, which can show $0
+    on the CLOB even when the UI shows a balance under the proxy.
+    """
+    from py_order_utils.model import EOA, POLY_GNOSIS_SAFE, POLY_PROXY
+
+    raw = os.getenv("POLYMARKET_SIGNATURE_TYPE", "").strip()
+    funder_env = os.getenv("POLYMARKET_FUNDER", "").strip() or None
+
+    if not raw:
+        if funder_env:
+            print(
+                "  Warning: POLYMARKET_FUNDER is set but POLYMARKET_SIGNATURE_TYPE is not; funder is ignored for EOA. "
+                "Set POLYMARKET_SIGNATURE_TYPE=1 (or 2) if your balance is in a Polymarket proxy/safe.",
+                flush=True,
+            )
+        return None, None
+
+    upper = raw.upper()
+    if upper in ("0", "EOA"):
+        sig = EOA
+    elif upper in ("1", "POLY_PROXY", "PROXY"):
+        sig = POLY_PROXY
+    elif upper in ("2", "POLY_GNOSIS_SAFE", "GNOSIS", "SAFE"):
+        sig = POLY_GNOSIS_SAFE
+    else:
+        try:
+            sig = int(raw)
+        except ValueError as e:
+            raise ValueError(
+                f"Invalid POLYMARKET_SIGNATURE_TYPE={raw!r}; use 0, EOA, 1, POLY_PROXY, 2, or POLY_GNOSIS_SAFE"
+            ) from e
+        if sig not in (EOA, POLY_PROXY, POLY_GNOSIS_SAFE):
+            raise ValueError(f"Invalid POLYMARKET_SIGNATURE_TYPE={sig}; must be 0, 1, or 2")
+
+    if sig in (POLY_PROXY, POLY_GNOSIS_SAFE):
+        if not funder_env:
+            raise ValueError(
+                "POLYMARKET_FUNDER is required when POLYMARKET_SIGNATURE_TYPE is 1 (POLY_PROXY) or 2 "
+                "(POLY_GNOSIS_SAFE). In the Polymarket UI, copy the wallet/proxy address that holds your balance "
+                "(often shown under profile or deposit; it may differ from your MetaMask EOA)."
+            )
+        return sig, funder_env
+
+    if funder_env:
+        print(
+            "  Warning: POLYMARKET_FUNDER is ignored when using EOA (type 0); collateral is attributed to the signer only.",
+            flush=True,
+        )
+    return sig, None
+
+
 def get_clob_client() -> "ClobClient":
     from py_clob_client.client import ClobClient
 
     config = load_config()
+    sig_type, funder = _clob_signature_and_funder()
     client = ClobClient(
         CLOB_URL,
         key=config["private_key"],
         chain_id=CHAIN_ID,
+        signature_type=sig_type,
+        funder=funder,
     )
     client.set_api_creds(client.create_or_derive_api_creds())
+    b = client.builder
+    print(
+        f"  CLOB: signer={client.get_address()}  signature_type={b.sig_type}  funder={b.funder}",
+        flush=True,
+    )
+    if b.sig_type != 0:
+        print(
+            "  Hint: funder = Polymarket “your wallet” 0x from the site (proxy). If orders fail invalid_signature, "
+            "try POLYMARKET_SIGNATURE_TYPE=2 for MetaMask/Rabby, or 1 for Magic/email export only.",
+            flush=True,
+        )
     return client
 
 
@@ -287,13 +370,23 @@ def _fmt_event(slug: str) -> str:
     return slug[:40] + ("…" if len(slug) > 40 else "")
 
 
-def _print_buy(tag: str, event_slug: str, bracket: str, price: float, pred: float = None, usd: float = None):
+def _print_buy(
+    tag: str,
+    event_slug: str,
+    bracket: str,
+    price: float,
+    pred: float = None,
+    usd: float = None,
+    suffix: str = "",
+):
     ev = _fmt_event(event_slug)
     parts = [f"  [{tag}]", ev, f"bracket {bracket}", f"@ {price:.4f}"]
     if pred is not None:
         parts.append(f"pred={pred:.1f}x")
     if usd is not None:
         parts.append(f"${usd}")
+    if suffix:
+        parts.append(suffix.strip())
     print("  ".join(parts))
 
 
@@ -788,42 +881,179 @@ def score_candidates(
     return result
 
 
-def place_buy_order(client, token_id: str, price: float, usd_amount: float, tick_size: str = "0.01") -> dict | None:
-    from py_clob_client.clob_types import OrderArgs, PartialCreateOrderOptions
+def _order_limit_price(price: float) -> float:
+    """Limit price for CLOB orders: never use round(x, 2) alone — sub-$0.01 brackets become 0.0."""
+    if not math.isfinite(price) or price <= 0:
+        return 0.0
+    d = Decimal(str(price)).quantize(Decimal("0.000001"), rounding=ROUND_DOWN)
+    return float(d)
+
+
+def _print_polymarket_order_error(exc: BaseException, *, sell: bool = False) -> None:
+    """Explain common API failures (e.g. CLOB geoblock on cloud IPs)."""
+    prefix = "  Sell order failed" if sell else "  Order failed"
+    print(f"{prefix}: {exc}")
+    try:
+        from py_clob_client.exceptions import PolyApiException
+
+        if not isinstance(exc, PolyApiException):
+            return
+        blob = str(exc.error_msg).lower()
+        if exc.status_code == 403 and (
+            "geoblock" in blob or "restricted in your region" in blob or "trading restricted" in blob
+        ):
+            print(
+                "  Note: Polymarket geoblocks by detected location/IP. Hosting in a US Railway region does not "
+                "guarantee a US-residential or allowlisted egress IP; many cloud ranges are blocked. "
+                "Options: run the bot from a home/office network in an allowed region, or use infrastructure "
+                "Polymarket supports per https://docs.polymarket.com/developers/CLOB/geoblock — do not rely on "
+                "VPNs to evade restrictions if that violates their terms.",
+                flush=True,
+            )
+        if exc.status_code == 400 and (
+            "not enough balance" in blob or "allowance" in blob or "balance is not enough" in blob
+        ):
+            print(
+                "  Note: Usually not a wrong API key. The CLOB checks collateral for the configured **funder** "
+                "(default: your EOA from PK). Polymarket often holds your $ balance in a **proxy or Gnosis safe** "
+                "while the UI still shows one account — if PK is only the EOA, CLOB can see $0. Set "
+                "POLYMARKET_SIGNATURE_TYPE=1 (POLY_PROXY) or 2 (POLY_GNOSIS_SAFE) and POLYMARKET_FUNDER=0x… "
+                "to that proxy/safe address from the Polymarket UI. Also ensure USDC is deposited for trading and "
+                "approvals are done. Error amounts use token decimals (often ÷1e6 for USDC).",
+                flush=True,
+            )
+        if exc.status_code == 400 and "invalid signature" in blob:
+            print(
+                "  Note: invalid_signature usually means POLYMARKET_SIGNATURE_TYPE does not match how you use "
+                "Polymarket: try **2** (POLY_GNOSIS_SAFE) if you connect with MetaMask/Rabby/browser wallet; try **1** "
+                "(POLY_PROXY) only for Magic/email-exported keys. Funder must be your **Polymarket proxy** (the 0x "
+                "shown as your wallet on the site — not a “relayer” address). PK must be the one Polymarket exports "
+                "for that same account. See https://github.com/Polymarket/py-clob-client#start-trading-proxy-wallet",
+                flush=True,
+            )
+        if exc.status_code == 400 and "invalid amount" in blob and "marketable" in blob:
+            print(
+                "  Note: Market buys need notional >= ~$1. Raise BET_USD or BUY_MARKET_MIN_USD (default 1.01).",
+                flush=True,
+            )
+    except Exception:
+        pass
+
+
+def _clob_buy_side_price(client, token_id: str) -> float | None:
+    """CLOB executable BUY price for token (for comparing to Gamma snapshot)."""
+    try:
+        r = client.get_price(token_id, side="BUY")
+        if isinstance(r, dict):
+            v = r.get("price")
+            if v is None:
+                return None
+            return float(v)
+        return float(r)
+    except (TypeError, ValueError, KeyError, AttributeError):
+        return None
+
+
+def _merge_buy_resp(resp: dict | list | str | None, **extra) -> dict | None:
+    if resp is None:
+        return None
+    out = dict(resp) if isinstance(resp, dict) else {"raw": resp}
+    out.update(extra)
+    return out
+
+
+def place_buy_order(
+    client,
+    token_id: str,
+    price: float,
+    usd_amount: float,
+    tick_size: str | None = None,
+    *,
+    market_max_price_diff: float = 0.1,
+    market_min_usd: float = 1.01,
+) -> dict | None:
+    """Place a market (FOK) buy if CLOB BUY price is close to `price`; else limit order.
+
+    Market path uses FOK so the order either fills immediately or fails (no resting bid).
+    Polymarket enforces a minimum ~$1 notional on marketable buys; `market_min_usd` enforces a safe floor.
+    """
+    from py_clob_client.clob_types import MarketOrderArgs, OrderArgs, OrderType, PartialCreateOrderOptions
     from py_clob_client.order_builder.constants import BUY
 
-    size = int(usd_amount / price) if price > 0 else 0
+    limit_px = _order_limit_price(price)
+    if limit_px <= 0:
+        return None
+
+    live_buy = _clob_buy_side_price(client, token_id)
+    use_market = (
+        live_buy is not None
+        and abs(live_buy - limit_px) <= market_max_price_diff
+    )
+
+    opts = PartialCreateOrderOptions(tick_size=None if tick_size is None else str(tick_size), neg_risk=None)
+
+    if use_market:
+        notional = max(float(usd_amount), float(market_min_usd))
+        try:
+            mo = MarketOrderArgs(
+                token_id=token_id,
+                amount=notional,
+                side=BUY,
+                order_type=OrderType.FOK,
+            )
+            signed = client.create_market_order(mo, opts)
+            resp = client.post_order(signed, OrderType.FOK)
+            fill_est = live_buy if live_buy is not None else limit_px
+            return _merge_buy_resp(
+                resp,
+                _buy_mode="market",
+                _fill_price_est=float(fill_est),
+                _usd=float(notional),
+            )
+        except Exception as e:
+            _print_polymarket_order_error(e, sell=False)
+            return None
+
+    size = int(usd_amount / limit_px) if limit_px > 0 else 0
     if size < 1:
         return None
-
     try:
-        opts = PartialCreateOrderOptions(tick_size=tick_size, neg_risk=True)
         resp = client.create_and_post_order(
-            OrderArgs(token_id=token_id, price=round(price, 2), size=float(size), side=BUY),
+            OrderArgs(token_id=token_id, price=limit_px, size=float(size), side=BUY),
             opts,
         )
-        return resp
+        return _merge_buy_resp(
+            resp,
+            _buy_mode="limit",
+            _fill_price_est=float(limit_px),
+            _usd=float(usd_amount),
+        )
     except Exception as e:
-        print(f"  Order failed: {e}")
+        _print_polymarket_order_error(e, sell=False)
         return None
 
 
-def place_sell_order(client, token_id: str, price: float, size: int, tick_size: str = "0.01") -> dict | None:
+def place_sell_order(client, token_id: str, price: float, size: int, tick_size: str | None = None) -> dict | None:
     from py_clob_client.clob_types import OrderArgs, PartialCreateOrderOptions
     from py_clob_client.order_builder.constants import SELL
 
     if size < 1:
         return None
 
+    limit_px = _order_limit_price(price)
+    if limit_px <= 0:
+        return None
+
     try:
-        opts = PartialCreateOrderOptions(tick_size=tick_size, neg_risk=True)
+        tick = None if tick_size is None else str(tick_size)
+        opts = PartialCreateOrderOptions(tick_size=tick, neg_risk=None)
         resp = client.create_and_post_order(
-            OrderArgs(token_id=token_id, price=round(price, 2), size=float(size), side=SELL),
+            OrderArgs(token_id=token_id, price=limit_px, size=float(size), side=SELL),
             opts,
         )
         return resp
     except Exception as e:
-        print(f"  Sell order failed: {e}")
+        _print_polymarket_order_error(e, sell=True)
         return None
 
 
@@ -1006,13 +1236,46 @@ def run_bot():
                             continue
 
                         if client:
-                            resp = place_buy_order(client, row["token_id"], row["price"], bet_usd)
+                            resp = place_buy_order(
+                                client,
+                                row["token_id"],
+                                row["price"],
+                                bet_usd,
+                                market_max_price_diff=config["buy_market_max_price_diff"],
+                                market_min_usd=config["buy_market_min_usd"],
+                            )
                             if resp:
-                                shares = bet_usd / row["price"]
-                                add_holding(row["event_slug"], row["bracket_label"], row["price"], shares, row["token_id"], resp.get("orderID", ""))
-                                log_transaction("buy", event_slug=row["event_slug"], bracket=row["bracket_label"],
-                                                price=row["price"], shares=shares, usd=bet_usd, pred=row["_pred"])
-                                _print_buy("BOUGHT", row["event_slug"], row["bracket_label"], row["price"], usd=bet_usd)
+                                px = float(resp.get("_fill_price_est", row["price"]))
+                                usd_spent = float(resp.get("_usd", bet_usd))
+                                shares = usd_spent / max(px, 1e-12)
+                                mode = resp.get("_buy_mode", "limit")
+                                add_holding(
+                                    row["event_slug"],
+                                    row["bracket_label"],
+                                    px,
+                                    shares,
+                                    row["token_id"],
+                                    resp.get("orderID", resp.get("orderId", "")),
+                                )
+                                log_transaction(
+                                    "buy",
+                                    event_slug=row["event_slug"],
+                                    bracket=row["bracket_label"],
+                                    price=px,
+                                    shares=shares,
+                                    usd=usd_spent,
+                                    pred=row["_pred"],
+                                    order_mode=mode,
+                                )
+                                _print_buy(
+                                    "BOUGHT",
+                                    row["event_slug"],
+                                    row["bracket_label"],
+                                    px,
+                                    pred=row["_pred"],
+                                    usd=usd_spent,
+                                    suffix=f"[{mode}]",
+                                )
                                 n_positions += 1
                                 time.sleep(2)
 
