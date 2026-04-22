@@ -4,17 +4,15 @@
 #
 
 app = 'elon-twit-analysis'
-primary_region = 'iad'
+primary_region = 'nrt'
 
 [build]
 
-[http_service]
-  internal_port = 8080
-  force_https = true
-  auto_stop_machines = 'stop'
-  auto_start_machines = true
-  min_machines_running = 0
-  processes = ['app']
+# Command for the default `app` process group (Fly Machines). No [http_service]:
+# this workload is a long-running worker, not an HTTP server on :8080.
+
+[processes]
+  app = 'python trading_bot.py'
 
 [[vm]]
   memory = '1gb'
