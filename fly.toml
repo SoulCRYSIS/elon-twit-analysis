@@ -1,14 +1,23 @@
-# Create the app first: `fly apps create <name>` then set `app` here, or run
-# `fly launch --no-deploy` from this directory and merge the `app` line it generates.
-app = "elon-twit"
+# fly.toml app configuration file generated for elon-twit-analysis on 2026-04-21T10:26:19Z
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
 
-primary_region = "nrt"
+app = 'elon-twit-analysis'
+primary_region = 'iad'
 
 [build]
-  dockerfile = "Dockerfile"
 
-# Long-running bot: no [http_service] / [[services]] — those are for apps that
-# accept traffic on a port from Fly Proxy. An incomplete [[services]] block fails validation.
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = 'stop'
+  auto_start_machines = true
+  min_machines_running = 0
+  processes = ['app']
 
-[processes]
-  bot = "python trading_bot.py"
+[[vm]]
+  memory = '1gb'
+  cpu_kind = 'shared'
+  cpus = 1
+  memory_mb = 1024
