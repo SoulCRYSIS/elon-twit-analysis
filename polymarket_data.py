@@ -9,6 +9,7 @@ Data sources:
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 from datetime import datetime, timedelta, timezone
@@ -20,7 +21,21 @@ import requests
 GAMMA_URL = "https://gamma-api.polymarket.com"
 CLOB_URL = "https://clob.polymarket.com"
 DATA_API_URL = "https://data-api.polymarket.com"
-DATA_DIR = Path(__file__).parent / "data" / "polymarket"
+
+
+def _polymarket_data_dir() -> Path:
+    """Root for events.json, prices/, bracket_prices.parquet.
+
+    Prefer POLYMARKET_DATA_DIR (e.g. /data/polymarket on Fly with DATA_DIR=/data).
+    trading_bot sets this from DATA_DIR before importing this module.
+    """
+    raw = os.getenv("POLYMARKET_DATA_DIR", "").strip()
+    if raw:
+        return Path(raw).expanduser().resolve()
+    return Path(__file__).parent / "data" / "polymarket"
+
+
+DATA_DIR = _polymarket_data_dir()
 EVENTS_CACHE = DATA_DIR / "events.json"
 PRICES_DIR = DATA_DIR / "prices"
 PARQUET_PATH = DATA_DIR / "bracket_prices.parquet"

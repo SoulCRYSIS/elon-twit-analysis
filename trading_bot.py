@@ -15,7 +15,8 @@ Railway injects env vars at runtime; `.env` is optional and does not override ex
 
   PK or PRIVATE_KEY       - Wallet private key (required for live trading)
   DRY_RUN                 - "true" to disable real orders (PK optional if dry run)
-  DATA_DIR                - Base data directory (default: ./data); use a volume path on Railway
+  DATA_DIR                - Base data directory (default: ./data); use a volume path on Railway/Fly
+  POLYMARKET_DATA_DIR     - Optional override for polymarket cache (default: DATA_DIR/polymarket)
   GAMMA_URL, CLOB_URL     - Polymarket APIs (defaults: gamma-api / clob hostnames)
   CHAIN_ID                - Polygon chain id (default 137)
   BET_USD                 - USD per trade (default 1)
@@ -96,6 +97,8 @@ def _env_float(key: str, default: float) -> float:
 _data_env = os.getenv("DATA_DIR", "").strip()
 DATA_DIR = Path(_data_env).expanduser().resolve() if _data_env else ROOT / "data"
 POLYMARKET_DIR = DATA_DIR / "polymarket"
+# So polymarket_data (imported later) uses the same root as this module, not /app/data/polymarket from the image.
+os.environ.setdefault("POLYMARKET_DATA_DIR", str(POLYMARKET_DIR))
 HOLDINGS_PATH = DATA_DIR / "holdings.json"  # Positions — loaded on bot restart (real mode only)
 DRY_RUN_HOLDINGS_PATH = DATA_DIR / "dry_run_holdings.json"  # Simulated positions when --dry-run
 DRY_RUN_STATE_PATH = DATA_DIR / "dry_run_state.json"  # balance, start_balance (persists across restarts)
@@ -1085,7 +1088,8 @@ def run_bot():
     retrain_h = float(os.getenv("RETRAIN_HOURS", RETRAIN_HOURS))
     print(
         f"Config: bet=${config['bet_usd']}, max_positions={config['max_positions']}, "
-        f"poll={config['poll_interval']}s, data_dir={DATA_DIR}, retrain_every={retrain_h}h"
+        f"poll={config['poll_interval']}s, data_dir={DATA_DIR}, polymarket_cache={POLYMARKET_DIR}, "
+        f"retrain_every={retrain_h}h"
     )
     holdings = load_holdings(dry_run=dry_run)
     holdings_path = DRY_RUN_HOLDINGS_PATH if dry_run else HOLDINGS_PATH
