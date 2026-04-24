@@ -1,5 +1,8 @@
 .git
 .env
+# Repo ./data is local / git-tracked snapshots — do not bake into the image as /app/data
+# (confusing vs Fly volume at /data). Runtime state belongs on DATA_DIR volume only.
+data/
 .venv
 __pycache__
 *.pyc

@@ -1036,11 +1036,55 @@ def place_buy_order(
         return None
 
 
-def place_sell_order(client, token_id: str, price: float, size: int, tick_size: str | None = None) -> dict | None:
+def _clob_conditional_balance_shares(client, token_id: str) -> float | None:
+    """Return spendable outcome-token balance in **shares** (human scale), or None if unknown."""
+    from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
+
+    try:
+        r = client.get_balance_allowance(
+            BalanceAllowanceParams(
+                asset_type=AssetType.CONDITIONAL,
+                token_id=str(token_id),
+            )
+        )
+    except Exception:
+        return None
+    if not isinstance(r, dict):
+        return None
+    raw_bal = r.get("balance")
+    if raw_bal is None:
+        return None
+    try:
+        micro = int(str(raw_bal))
+    except (TypeError, ValueError):
+        return None
+    # Polymarket / CLOB: conditional token amounts use 1e6 micro-units (same scale as API errors).
+    return micro / 1_000_000.0
+
+
+def _sell_shares_capped(
+    client, token_id: str, recorded_shares: float
+) -> tuple[float, str | None]:
+    """Use min(holdings, on-chain balance). Holdings often exceed wallet after partial fills or drift."""
+    cap = _clob_conditional_balance_shares(client, token_id)
+    if cap is None:
+        return float(recorded_shares), None
+    sell = min(float(recorded_shares), max(0.0, cap))
+    note = None
+    if cap + 1e-9 < float(recorded_shares):
+        note = (
+            f"Sell size capped: holdings {float(recorded_shares):.6f} shares → CLOB balance {cap:.6f}"
+        )
+    return sell, note
+
+
+def place_sell_order(
+    client, token_id: str, price: float, size: float, tick_size: str | None = None
+) -> dict | None:
     from py_clob_client.clob_types import OrderArgs, PartialCreateOrderOptions
     from py_clob_client.order_builder.constants import SELL
 
-    if size < 1:
+    if size <= 0:
         return None
 
     limit_px = _order_limit_price(price)
@@ -1173,14 +1217,32 @@ def run_bot():
                             _print_sell(h["event_slug"], h["bracket_label"], current, reason)
                             print(f"      +${proceeds:.2f}  balance=${state['balance']:.2f}")
                     elif client:
-                        resp = place_sell_order(client, h["token_id"], current, int(h["shares"]))
-                        if resp:
-                            remove_holding(h["event_slug"], h["bracket_label"])
-                            profit = (current - buy_price) * h["shares"]
-                            log_transaction("sell", event_slug=h["event_slug"], bracket=h["bracket_label"],
-                                            buy_price=buy_price, sell_price=current, shares=h["shares"],
-                                            return_x=ret, profit_usd=profit)
-                            _print_sell(h["event_slug"], h["bracket_label"], current, reason)
+                        recorded = float(h["shares"])
+                        sell_shares, cap_note = _sell_shares_capped(client, h["token_id"], recorded)
+                        if cap_note:
+                            print(f"  {cap_note}", flush=True)
+                        if sell_shares <= 0:
+                            print(
+                                "  Skip sell: on-chain conditional balance is 0 (update or clear stale holdings)",
+                                flush=True,
+                            )
+                        else:
+                            resp = place_sell_order(client, h["token_id"], current, sell_shares)
+                            if resp:
+                                remove_holding(h["event_slug"], h["bracket_label"])
+                                profit = (current - buy_price) * sell_shares
+                                log_transaction(
+                                    "sell",
+                                    event_slug=h["event_slug"],
+                                    bracket=h["bracket_label"],
+                                    buy_price=buy_price,
+                                    sell_price=current,
+                                    shares=sell_shares,
+                                    shares_recorded=recorded,
+                                    return_x=ret,
+                                    profit_usd=profit,
+                                )
+                                _print_sell(h["event_slug"], h["bracket_label"], current, reason)
 
             if dry_run:
                 holdings = load_holdings(dry_run=True)
