@@ -42,6 +42,7 @@ Railway injects env vars at runtime; `.env` is optional and does not override ex
   BUY_MARKET_MAX_PRICE_DIFF - If CLOB BUY price vs snapshot price differs by at most this (0–1 scale), submit a
                               market (FOK) buy so it fills; else a limit order (default 0.1)
   BUY_MARKET_MIN_USD      - Minimum USD notional for market buys (default 1.01; API rejects under about $1)
+  POLYMARKET_API_KEY / POLYMARKET_API_SECRET / POLYMARKET_PASSPHRASE — optional; if set, skips L1 derive/create
   POLYMARKET_SIGNATURE_TYPE - CLOB signing: 0=EOA (MetaMask key is the trading wallet, no proxy). 1=POLY_PROXY
                               (Magic / email login — PK exported from Polymarket). 2=POLY_GNOSIS_SAFE (most browser
                               wallets: MetaMask/Rabby connected to Polymarket — use this if you did NOT sign up with
@@ -220,6 +221,58 @@ def _clob_signature_and_funder() -> tuple[int | None, str | None]:
     return sig, None
 
 
+def _clob_api_creds_from_env():
+    """Optional L2 creds — skip L1 create/derive (avoids noisy 400s when a key already exists)."""
+    from py_clob_client_v2.clob_types import ApiCreds
+
+    k = (os.getenv("POLYMARKET_API_KEY") or os.getenv("CLOB_API_KEY") or "").strip()
+    sec = (
+        os.getenv("POLYMARKET_API_SECRET")
+        or os.getenv("POLYMARKET_SECRET")
+        or os.getenv("CLOB_SECRET")
+        or ""
+    ).strip()
+    ph = (
+        os.getenv("POLYMARKET_PASSPHRASE")
+        or os.getenv("CLOB_PASSPHRASE")
+        or ""
+    ).strip()
+    if not (k and sec and ph):
+        return None
+    return ApiCreds(api_key=k, api_secret=sec, api_passphrase=ph)
+
+
+def _clob_set_api_creds(client) -> None:
+    """Configure L2 API creds: env overrides, else derive existing key first, then create (new wallets)."""
+    manual = _clob_api_creds_from_env()
+    if manual:
+        client.set_api_creds(manual)
+        print(
+            "  CLOB: using POLYMARKET_API_* (or CLOB_API_KEY/CLOB_SECRET/CLOB_PASSPHRASE) from environment.",
+            flush=True,
+        )
+        return
+    err_derive = None
+    try:
+        client.set_api_creds(client.derive_api_key())
+        print("  CLOB: derived API credentials (wallet already had a Polymarket CLOB API key).", flush=True)
+        return
+    except Exception as e:
+        err_derive = e
+    try:
+        client.set_api_creds(client.create_api_key())
+        print("  CLOB: registered new Polymarket API credentials.", flush=True)
+        return
+    except Exception as e:
+        hint = (
+            " Set POLYMARKET_API_KEY, POLYMARKET_API_SECRET, POLYMARKET_PASSPHRASE from Polymarket’s "
+            "developer/builder tooling if automated L1 signup keeps failing."
+        )
+        raise RuntimeError(
+            f"Could not obtain CLOB API credentials (derive: {err_derive!r}; create: {e!r}).{hint}"
+        ) from e
+
+
 def get_clob_client() -> "ClobClient":
     """Use py-clob-client **v2** (CLOB post-migration uses V2 order payloads; v1 hits order_version_mismatch)."""
     from py_clob_client_v2 import ClobClient
@@ -233,7 +286,7 @@ def get_clob_client() -> "ClobClient":
         signature_type=sig_type,
         funder=funder,
     )
-    client.set_api_creds(client.create_or_derive_api_key())
+    _clob_set_api_creds(client)
     b = client.builder
     print(
         f"  CLOB: signer={client.get_address()}  signature_type={b.sig_type}  funder={b.funder}",
