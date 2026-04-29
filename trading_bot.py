@@ -288,11 +288,13 @@ def get_clob_client() -> "ClobClient":
     )
     _clob_set_api_creds(client)
     b = client.builder
+    sig_value = getattr(b, "signature_type", getattr(b, "sig_type", None))
+    sig_int = int(sig_value) if sig_value is not None else None
     print(
-        f"  CLOB: signer={client.get_address()}  signature_type={b.sig_type}  funder={b.funder}",
+        f"  CLOB: signer={client.get_address()}  signature_type={sig_int}  funder={b.funder}",
         flush=True,
     )
-    if b.sig_type != 0:
+    if sig_int and sig_int != 0:
         print(
             "  Hint: funder = Polymarket “your wallet” 0x from the site (proxy). If orders fail invalid_signature, "
             "try POLYMARKET_SIGNATURE_TYPE=2 for MetaMask/Rabby, or 1 for Magic/email export only.",
