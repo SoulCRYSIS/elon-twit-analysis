@@ -221,7 +221,8 @@ def _clob_signature_and_funder() -> tuple[int | None, str | None]:
 
 
 def get_clob_client() -> "ClobClient":
-    from py_clob_client.client import ClobClient
+    """Use py-clob-client **v2** (CLOB post-migration uses V2 order payloads; v1 hits order_version_mismatch)."""
+    from py_clob_client_v2 import ClobClient
 
     config = load_config()
     sig_type, funder = _clob_signature_and_funder()
@@ -232,7 +233,7 @@ def get_clob_client() -> "ClobClient":
         signature_type=sig_type,
         funder=funder,
     )
-    client.set_api_creds(client.create_or_derive_api_creds())
+    client.set_api_creds(client.create_or_derive_api_key())
     b = client.builder
     print(
         f"  CLOB: signer={client.get_address()}  signature_type={b.sig_type}  funder={b.funder}",
@@ -892,12 +893,40 @@ def _order_limit_price(price: float) -> float:
     return float(d)
 
 
+def _clob_valid_limit_price(
+    client,
+    token_id: str,
+    snapshot_price: float,
+) -> tuple[float, str | None]:
+    """Clamp price to [tick, 1−tick] — CLOB rejects e.g. 0.0005 when min tick is 0.001."""
+    if not math.isfinite(snapshot_price) or snapshot_price <= 0:
+        return 0.0, None
+    try:
+        tick = client.get_tick_size(str(token_id))
+        ts = float(tick)
+    except Exception:
+        ts = 0.001
+        tick = "0.001"
+    lo, hi = ts, 1.0 - ts
+    clipped = max(lo, min(hi, float(snapshot_price)))
+    limit_px = _order_limit_price(clipped)
+    if limit_px <= 0:
+        return 0.0, None
+    note = None
+    if abs(limit_px - float(snapshot_price)) > 1e-9:
+        note = (
+            f"Limit price adjusted to tick {tick} (valid [{lo:.6g}, {hi:.6g}]): "
+            f"snapshot {float(snapshot_price):.6g} → {limit_px:.6g}"
+        )
+    return limit_px, note
+
+
 def _print_polymarket_order_error(exc: BaseException, *, sell: bool = False) -> None:
     """Explain common API failures (e.g. CLOB geoblock on cloud IPs)."""
     prefix = "  Sell order failed" if sell else "  Order failed"
     print(f"{prefix}: {exc}")
     try:
-        from py_clob_client.exceptions import PolyApiException
+        from py_clob_client_v2.exceptions import PolyApiException
 
         if not isinstance(exc, PolyApiException):
             return
@@ -911,6 +940,12 @@ def _print_polymarket_order_error(exc: BaseException, *, sell: bool = False) -> 
                 "Options: run the bot from a home/office network in an allowed region, or use infrastructure "
                 "Polymarket supports per https://docs.polymarket.com/developers/CLOB/geoblock — do not rely on "
                 "VPNs to evade restrictions if that violates their terms.",
+                flush=True,
+            )
+        if exc.status_code == 400 and "order_version_mismatch" in blob:
+            print(
+                "  Note: CLOB migrated to V2 orders; this bot uses py-clob-client-v2. Upgrade: "
+                "pip install -U 'py-clob-client-v2>=1.0.0'.",
                 flush=True,
             )
         if exc.status_code == 400 and (
@@ -980,10 +1015,12 @@ def place_buy_order(
     Market path uses FOK so the order either fills immediately or fails (no resting bid).
     Polymarket enforces a minimum ~$1 notional on marketable buys; `market_min_usd` enforces a safe floor.
     """
-    from py_clob_client.clob_types import MarketOrderArgs, OrderArgs, OrderType, PartialCreateOrderOptions
-    from py_clob_client.order_builder.constants import BUY
+    from py_clob_client_v2.clob_types import MarketOrderArgs, OrderArgs, OrderType, PartialCreateOrderOptions
+    from py_clob_client_v2.order_builder.constants import BUY
 
-    limit_px = _order_limit_price(price)
+    limit_px, clip_note = _clob_valid_limit_price(client, token_id, price)
+    if clip_note:
+        print(f"  {clip_note}", flush=True)
     if limit_px <= 0:
         return None
 
@@ -1038,7 +1075,7 @@ def place_buy_order(
 
 def _clob_conditional_balance_shares(client, token_id: str) -> float | None:
     """Return spendable outcome-token balance in **shares** (human scale), or None if unknown."""
-    from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
+    from py_clob_client_v2.clob_types import AssetType, BalanceAllowanceParams
 
     try:
         r = client.get_balance_allowance(
@@ -1081,13 +1118,15 @@ def _sell_shares_capped(
 def place_sell_order(
     client, token_id: str, price: float, size: float, tick_size: str | None = None
 ) -> dict | None:
-    from py_clob_client.clob_types import OrderArgs, PartialCreateOrderOptions
-    from py_clob_client.order_builder.constants import SELL
+    from py_clob_client_v2.clob_types import OrderArgs, PartialCreateOrderOptions
+    from py_clob_client_v2.order_builder.constants import SELL
 
     if size <= 0:
         return None
 
-    limit_px = _order_limit_price(price)
+    limit_px, clip_note = _clob_valid_limit_price(client, token_id, price)
+    if clip_note:
+        print(f"  {clip_note}", flush=True)
     if limit_px <= 0:
         return None
 
