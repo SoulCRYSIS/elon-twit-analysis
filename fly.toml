@@ -30,7 +30,7 @@ primary_region = "nrt"
   app = "python trading_bot.py"
 
 [[vm]]
-  memory = "3gb"
+  memory = "2gb"
   cpu_kind = "shared"
   cpus = 1
-  memory_mb = 3072
+  memory_mb = 2048
