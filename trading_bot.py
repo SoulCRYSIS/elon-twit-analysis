@@ -64,6 +64,13 @@ from datetime import datetime, timezone
 from decimal import Decimal, ROUND_DOWN
 from pathlib import Path
 
+# Cap BLAS / numexpr thread arenas BEFORE numpy imports — each thread can grab
+# a multi-MB private heap; on a 2 GB Fly Machine this alone OOM-kills the bot
+# during retrain (numpy/sklearn). Allow override via env if you upgrade the VM.
+for _k in ("OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "OMP_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+    os.environ.setdefault(_k, "1")
+os.environ.setdefault("MALLOC_ARENA_MAX", "2")  # glibc: cap allocator arenas → less fragmentation
+
 import numpy as np
 import pandas as pd
 import requests
@@ -810,16 +817,50 @@ def _save_retrain_time(ts: datetime):
         json.dump({"last_retrain": ts.isoformat()}, f, indent=2)
 
 
+def _retrain_in_subprocess() -> bool:
+    """Run training in a child process; OS reclaims memory on exit (peak retrain ~2 GB)."""
+    import subprocess
+
+    cmd = [sys.executable, str(ROOT / "trading_bot.py"), "--train-only"]
+    print(f"  Retraining in subprocess: {' '.join(cmd)}", flush=True)
+    try:
+        result = subprocess.run(cmd, check=False, env=os.environ.copy())
+    except Exception as e:
+        print(f"  Retrain subprocess failed to launch: {e}")
+        return False
+    if result.returncode != 0:
+        print(f"  Retrain subprocess exited with code {result.returncode}")
+        return False
+    return True
+
+
+def _reload_model_from_disk() -> dict | None:
+    if not MODEL_PATH.exists():
+        return None
+    import pickle
+    with open(MODEL_PATH, "rb") as f:
+        return pickle.load(f)
+
+
 def refresh_data_and_retrain() -> dict | None:
-    """Fetch new Polymarket data (incremental) and retrain the model. Returns new model_info or None on failure."""
+    """Fetch new Polymarket data + retrain. Run in subprocess so memory drops back after.
+
+    Falls back to in-process if subprocess fails (e.g. cannot exec) — same memory profile as before.
+    """
+    if _retrain_in_subprocess():
+        info = _reload_model_from_disk()
+        if info is not None:
+            _save_retrain_time(datetime.now(timezone.utc))
+            print(f"  Model retrained. Features: {len(info['feature_names'])}")
+            return info
+
     from polymarket_data import get_polymarket_data
     from pm_features import build_bracket_features, add_return_labels
     from pm_outcome import train_outcome_model
 
     try:
-        # Use incremental: only fetch new events + append new price data (fast)
         parquet = POLYMARKET_DIR / "bracket_prices.parquet"
-        incremental = parquet.exists()  # We have prior data, do incremental
+        incremental = parquet.exists()
         print("  Fetching Polymarket data (incremental)..." if incremental else "  Fetching Polymarket data (full)...", flush=True)
         df, _ = get_polymarket_data(incremental=incremental, force_refresh=False, verbose=True)
         if df.empty:
@@ -836,12 +877,29 @@ def refresh_data_and_retrain() -> dict | None:
             pickle.dump(info, f)
         _save_retrain_time(datetime.now(timezone.utc))
         print(f"  Model retrained. Features: {len(info['feature_names'])}")
+
+        del df, featured, labeled
+        _trim_memory()
         return info
     except Exception as e:
         print(f"  Retrain failed: {e}")
         import traceback
         traceback.print_exc()
         return None
+
+
+def _trim_memory() -> None:
+    """Force GC + glibc malloc_trim so freed pages return to the OS (helps long-running pandas workloads)."""
+    import gc
+
+    gc.collect()
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL("libc.so.6", use_errno=False)
+        libc.malloc_trim(0)
+    except (OSError, AttributeError):
+        pass
 
 
 def should_retrain() -> bool:
