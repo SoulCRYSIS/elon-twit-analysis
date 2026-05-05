@@ -1228,10 +1228,35 @@ def _sell_shares_capped(
     return sell, note
 
 
+def _clob_sell_side_price(client, token_id: str) -> float | None:
+    """Best live SELL price on the CLOB (lowest ask). Used to decide market vs. limit sell."""
+    try:
+        r = client.get_price(token_id, side="SELL")
+        if isinstance(r, dict):
+            v = r.get("price")
+            if v is None:
+                return None
+            return float(v)
+        return float(r)
+    except (TypeError, ValueError, KeyError, AttributeError):
+        return None
+
+
 def place_sell_order(
-    client, token_id: str, price: float, size: float, tick_size: str | None = None
+    client,
+    token_id: str,
+    price: float,
+    size: float,
+    tick_size: str | None = None,
+    *,
+    market_max_price_diff: float = 0.1,
 ) -> dict | None:
-    from py_clob_client_v2.clob_types import OrderArgs, PartialCreateOrderOptions
+    """Sell shares. Mirrors buy logic: FOK market order if a live ask is close, else GTC limit.
+
+    `market_max_price_diff` is the max abs difference between the snapshot price and the live
+    SELL-side price before we fall back to a limit order (default 0.1 = 10 cents on a $0–$1 scale).
+    """
+    from py_clob_client_v2.clob_types import MarketOrderArgs, OrderArgs, OrderType, PartialCreateOrderOptions
     from py_clob_client_v2.order_builder.constants import SELL
 
     if size <= 0:
@@ -1243,12 +1268,44 @@ def place_sell_order(
     if limit_px <= 0:
         return None
 
+    opts = PartialCreateOrderOptions(tick_size=tick_size, neg_risk=None)
+
+    # --- Try market (FOK) first, same pattern as buys ---
+    live_sell = _clob_sell_side_price(client, token_id)
+    use_market = (
+        live_sell is not None
+        and abs(live_sell - limit_px) <= market_max_price_diff
+    )
+
+    if use_market:
+        try:
+            mo = MarketOrderArgs(
+                token_id=token_id,
+                amount=float(size),  # for SELL, amount = shares to sell
+                side=SELL,
+                order_type=OrderType.FOK,
+            )
+            signed = client.create_market_order(mo, opts)
+            resp = client.post_order(signed, OrderType.FOK)
+            print(
+                f"  Sell market FOK: {size:.4f} shares @ live {live_sell:.4f} (snapshot {limit_px:.4f})",
+                flush=True,
+            )
+            return resp
+        except Exception as e:
+            _print_polymarket_order_error(e, sell=True)
+            return None
+
+    # --- Fallback: GTC limit order ---
     try:
-        tick = None if tick_size is None else str(tick_size)
-        opts = PartialCreateOrderOptions(tick_size=tick, neg_risk=None)
         resp = client.create_and_post_order(
             OrderArgs(token_id=token_id, price=limit_px, size=float(size), side=SELL),
             opts,
+        )
+        print(
+            f"  Sell limit GTC: {size:.4f} shares @ {limit_px:.4f} "
+            f"(no live ask within {market_max_price_diff} of snapshot; live={live_sell})",
+            flush=True,
         )
         return resp
     except Exception as e:
