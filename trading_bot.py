@@ -427,6 +427,124 @@ def remove_holding(slug: str, bracket: str):
     return before - len(holdings)
 
 
+def _holding_age_seconds(h: dict) -> float:
+    """Seconds since the last buy on this holding. Used to give fresh orders grace before sweeping."""
+    ts = h.get("last_buy_time") or h.get("buy_time")
+    if not ts:
+        return float("inf")
+    try:
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return float("inf")
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - dt).total_seconds()
+
+
+def sweep_resolved_holdings(
+    client,
+    active_keys: set[tuple[str, str]],
+    *,
+    grace_seconds: float = 600.0,
+) -> list[dict]:
+    """Remove holdings whose market has resolved (event no longer active **and** on-chain balance is 0).
+
+    A position is considered resolved when:
+      - The (event_slug, bracket_label) is not present in the current active-events snapshot, AND
+      - The on-chain conditional-token balance for that token_id is 0, AND
+      - The holding is older than `grace_seconds` (so a buy that just settled isn't pruned by mistake).
+
+    Returns the list of holdings that were removed (already logged to transactions.jsonl).
+    """
+    holdings = load_holdings()
+    if not holdings or client is None:
+        return []
+
+    removed: list[dict] = []
+    keep: list[dict] = []
+    for h in holdings:
+        key = (h.get("event_slug"), h.get("bracket_label"))
+        # Active event → leave it alone, the SELL loop will handle it.
+        if key in active_keys:
+            keep.append(h)
+            continue
+
+        # Too fresh to call "resolved" — could be a recently-bought position still settling.
+        if _holding_age_seconds(h) < grace_seconds:
+            keep.append(h)
+            continue
+
+        token_id = h.get("token_id")
+        if not token_id:
+            keep.append(h)
+            continue
+
+        bal = _clob_conditional_balance_shares(client, str(token_id))
+        # bal=None → API hiccup; be conservative and keep it. bal>0 → still holding tokens, keep.
+        if bal is None or bal > 1e-9:
+            keep.append(h)
+            continue
+
+        removed.append(h)
+        log_transaction(
+            "resolved",
+            event_slug=h.get("event_slug"),
+            bracket=h.get("bracket_label"),
+            buy_price=h.get("buy_price"),
+            shares=h.get("shares"),
+            token_id=token_id,
+            reason="market_no_longer_active_and_clob_balance_zero",
+        )
+
+    if removed:
+        save_holdings(keep)
+        for h in removed:
+            ev = _fmt_event(h.get("event_slug", ""))
+            print(
+                f"  Cleared resolved holding: {ev} bracket {h.get('bracket_label')} "
+                f"(x{float(h.get('shares', 0)):.0f} @ {float(h.get('buy_price', 0)):.4f})",
+                flush=True,
+            )
+    return removed
+
+
+def sweep_resolved_dry_holdings(active_keys: set[tuple[str, str]]) -> list[dict]:
+    """Dry-run equivalent: drop dry-run holdings whose event is no longer active.
+
+    No on-chain check available, so we just trust the active-events snapshot after a grace period.
+    """
+    if not DRY_RUN_HOLDINGS_PATH.exists():
+        return []
+    with open(DRY_RUN_HOLDINGS_PATH) as f:
+        holdings = json.load(f)
+    removed: list[dict] = []
+    keep: list[dict] = []
+    for h in holdings:
+        key = (h.get("event_slug"), h.get("bracket_label"))
+        if key in active_keys or _holding_age_seconds(h) < 600.0:
+            keep.append(h)
+            continue
+        removed.append(h)
+        log_dry_transaction(
+            "resolved",
+            event_slug=h.get("event_slug"),
+            bracket=h.get("bracket_label"),
+            buy_price=h.get("buy_price"),
+            shares=h.get("shares"),
+            reason="market_no_longer_active",
+        )
+    if removed:
+        with open(DRY_RUN_HOLDINGS_PATH, "w") as f:
+            json.dump(keep, f, indent=2)
+        for h in removed:
+            ev = _fmt_event(h.get("event_slug", ""))
+            print(
+                f"  Cleared resolved dry holding: {ev} bracket {h.get('bracket_label')}",
+                flush=True,
+            )
+    return removed
+
+
 def _fmt_event(slug: str) -> str:
     """Shorten event slug: elon-musk-of-tweets-march-10-march-17 -> March 10 March 17"""
     for prefix in ("elon-musk-of-tweets-", "elon-musk-tweets-"):
@@ -1386,6 +1504,13 @@ def run_bot():
                 time.sleep(poll_sec)
                 continue
 
+            # --- Sweep resolved markets out of holdings.json before counting positions ---
+            active_keys = set(zip(df["event_slug"], df["bracket_label"]))
+            if dry_run:
+                sweep_resolved_dry_holdings(active_keys)
+            elif client is not None:
+                sweep_resolved_holdings(client, active_keys)
+
             holdings = load_holdings(dry_run=dry_run)
             n_positions = len(set((h["event_slug"], h["bracket_label"]) for h in holdings))
             max_pos = config["max_positions"]
@@ -1685,6 +1810,7 @@ def main():
     parser.add_argument("--holdings", action="store_true", help="Show holdings")
     parser.add_argument("--transactions", action="store_true", help="Show recent transactions")
     parser.add_argument("--reset-dry", action="store_true", help="Reset dry run state (balance + holdings) and exit")
+    parser.add_argument("--sweep-stale", action="store_true", help="Drop holdings whose markets resolved (on-chain balance == 0) and exit")
     parser.add_argument("--correlations", action="store_true", help="Print feature correlations vs max_return_all")
     parser.add_argument("--train-only", action="store_true", help="Pre-train model and exit")
     parser.add_argument("--backtest", type=int, nargs="?", const=120, metavar="DAYS", help="Run 120-day backtest (default: 120)")
@@ -1738,6 +1864,26 @@ def main():
         if TRANSACTIONS_PATH.exists():
             for line in open(TRANSACTIONS_PATH).readlines()[-20:]:
                 print(line.strip())
+        return
+
+    if args.sweep_stale:
+        dry = os.getenv("DRY_RUN", "false").lower() == "true" or args.dry_run
+        print("Fetching active events to determine which holdings are still tradable...")
+        try:
+            events = fetch_active_events()
+            df = fetch_current_prices(events) if events else pd.DataFrame()
+        except Exception as e:
+            print(f"  Failed to fetch active events: {e}")
+            df = pd.DataFrame()
+        active_keys: set[tuple[str, str]] = set()
+        if not df.empty:
+            active_keys = set(zip(df["event_slug"], df["bracket_label"]))
+        if dry:
+            removed = sweep_resolved_dry_holdings(active_keys)
+        else:
+            client = get_clob_client()
+            removed = sweep_resolved_holdings(client, active_keys, grace_seconds=0.0)
+        print(f"Removed {len(removed)} stale holding(s).")
         return
 
     if args.reset_dry:
