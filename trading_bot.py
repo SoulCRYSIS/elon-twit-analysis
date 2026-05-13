@@ -367,7 +367,27 @@ def remove_dry_holding(slug: str, bracket: str) -> dict | None:
     return removed
 
 
-def add_dry_holding(slug: str, bracket: str, price: float, shares: float, token_id: str):
+def _coerce_iso(ts) -> str | None:
+    """Normalize a timestamp (datetime / pandas Timestamp / str) to an ISO-8601 string, or None."""
+    if ts is None:
+        return None
+    try:
+        if hasattr(ts, "isoformat"):
+            return ts.isoformat()
+        s = str(ts).strip()
+        return s or None
+    except Exception:
+        return None
+
+
+def add_dry_holding(
+    slug: str,
+    bracket: str,
+    price: float,
+    shares: float,
+    token_id: str,
+    event_end: str | None = None,
+):
     """Save simulated buy to dry_run_holdings.json for testing."""
     holdings = []
     if DRY_RUN_HOLDINGS_PATH.exists():
@@ -375,30 +395,45 @@ def add_dry_holding(slug: str, bracket: str, price: float, shares: float, token_
             holdings = json.load(f)
     existing = next((h for h in holdings if h["event_slug"] == slug and h["bracket_label"] == bracket), None)
     now_iso = datetime.now(timezone.utc).isoformat()
+    end_iso = _coerce_iso(event_end)
     if existing:
         total_shares = existing["shares"] + shares
         avg_price = (existing["buy_price"] * existing["shares"] + price * shares) / total_shares
         existing["shares"] = total_shares
         existing["buy_price"] = avg_price
         existing["last_buy_time"] = now_iso
+        if end_iso and not existing.get("event_end"):
+            existing["event_end"] = end_iso
     else:
-        holdings.append({
+        h = {
             "event_slug": slug,
             "bracket_label": bracket,
             "buy_price": price,
             "shares": shares,
             "token_id": token_id,
             "buy_time": now_iso,
-        })
+        }
+        if end_iso:
+            h["event_end"] = end_iso
+        holdings.append(h)
     DRY_RUN_HOLDINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
     with open(DRY_RUN_HOLDINGS_PATH, "w") as f:
         json.dump(holdings, f, indent=2)
 
 
-def add_holding(slug: str, bracket: str, price: float, shares: float, token_id: str, order_id: str):
+def add_holding(
+    slug: str,
+    bracket: str,
+    price: float,
+    shares: float,
+    token_id: str,
+    order_id: str,
+    event_end: str | None = None,
+):
     holdings = load_holdings()
     existing = next((h for h in holdings if h["event_slug"] == slug and h["bracket_label"] == bracket), None)
     now_iso = datetime.now(timezone.utc).isoformat()
+    end_iso = _coerce_iso(event_end)
     if existing:
         total_shares = existing["shares"] + shares
         avg_price = (existing["buy_price"] * existing["shares"] + price * shares) / total_shares
@@ -406,8 +441,10 @@ def add_holding(slug: str, bracket: str, price: float, shares: float, token_id: 
         existing["buy_price"] = avg_price
         existing["order_id"] = order_id
         existing["last_buy_time"] = now_iso
+        if end_iso and not existing.get("event_end"):
+            existing["event_end"] = end_iso
     else:
-        holdings.append({
+        h = {
             "event_slug": slug,
             "bracket_label": bracket,
             "buy_price": price,
@@ -415,7 +452,10 @@ def add_holding(slug: str, bracket: str, price: float, shares: float, token_id: 
             "token_id": token_id,
             "order_id": order_id,
             "buy_time": now_iso,
-        })
+        }
+        if end_iso:
+            h["event_end"] = end_iso
+        holdings.append(h)
     save_holdings(holdings)
 
 
@@ -427,64 +467,87 @@ def remove_holding(slug: str, bracket: str):
     return before - len(holdings)
 
 
-def _holding_age_seconds(h: dict) -> float:
-    """Seconds since the last buy on this holding. Used to give fresh orders grace before sweeping."""
-    ts = h.get("last_buy_time") or h.get("buy_time")
-    if not ts:
-        return float("inf")
+def _parse_iso_utc(ts) -> datetime | None:
+    """Parse an ISO-8601 timestamp to a tz-aware UTC datetime, or None on failure."""
+    if ts is None:
+        return None
+    s = str(ts).strip()
+    if not s:
+        return None
     try:
-        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
     except (TypeError, ValueError):
-        return float("inf")
+        return None
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
-    return (datetime.now(timezone.utc) - dt).total_seconds()
+    return dt.astimezone(timezone.utc)
+
+
+def _gamma_event_end_date(slug: str) -> str | None:
+    """Look up an event's endDate on Gamma by slug. Used as fallback for legacy holdings."""
+    if not slug:
+        return None
+    try:
+        resp = requests.get(f"{GAMMA_URL}/events", params={"slug": slug}, timeout=15)
+        resp.raise_for_status()
+        arr = resp.json()
+        if isinstance(arr, list) and arr:
+            return arr[0].get("endDate")
+    except (requests.RequestException, ValueError):
+        pass
+    return None
+
+
+def _holding_end_dt(h: dict, *, cache: dict[str, str | None]) -> datetime | None:
+    """Best-effort end-of-market datetime for a holding (cached Gamma lookup if not stored)."""
+    end = h.get("event_end")
+    if not end:
+        slug = h.get("event_slug")
+        if slug:
+            if slug not in cache:
+                cache[slug] = _gamma_event_end_date(slug)
+            end = cache[slug]
+    return _parse_iso_utc(end)
 
 
 def sweep_resolved_holdings(
-    client,
+    client,  # kept for signature stability, no longer required
     active_keys: set[tuple[str, str]],
     *,
-    grace_seconds: float = 600.0,
+    closed_after_seconds: float = 3600.0,
 ) -> list[dict]:
-    """Remove holdings whose market has resolved (event no longer active **and** on-chain balance is 0).
+    """Remove holdings whose event has ended (endDate < now − `closed_after_seconds`).
 
-    A position is considered resolved when:
-      - The (event_slug, bracket_label) is not present in the current active-events snapshot, AND
-      - The on-chain conditional-token balance for that token_id is 0, AND
-      - The holding is older than `grace_seconds` (so a buy that just settled isn't pruned by mistake).
+    Detection logic, in order:
+      1. If the (event_slug, bracket_label) is still in the active-events snapshot → keep it.
+      2. Otherwise read `event_end` from the holding. If absent (legacy holdings), fetch via Gamma.
+      3. If `now − event_end ≥ closed_after_seconds` → resolved; remove and log.
 
-    Returns the list of holdings that were removed (already logged to transactions.jsonl).
+    `closed_after_seconds` is a buffer so we don't prune a position the instant the event ticks past
+    its end (resolution + final payout can take a few minutes in practice).
     """
+    del client  # unused; kept so existing callers don't break.
     holdings = load_holdings()
-    if not holdings or client is None:
+    if not holdings:
         return []
 
+    now = datetime.now(timezone.utc)
     removed: list[dict] = []
     keep: list[dict] = []
+    end_cache: dict[str, str | None] = {}
     for h in holdings:
         key = (h.get("event_slug"), h.get("bracket_label"))
-        # Active event → leave it alone, the SELL loop will handle it.
         if key in active_keys:
             keep.append(h)
             continue
-
-        # Too fresh to call "resolved" — could be a recently-bought position still settling.
-        if _holding_age_seconds(h) < grace_seconds:
+        end_dt = _holding_end_dt(h, cache=end_cache)
+        if end_dt is None:
+            # Can't determine when it ends → safest to keep so we don't drop a real position.
             keep.append(h)
             continue
-
-        token_id = h.get("token_id")
-        if not token_id:
+        if (now - end_dt).total_seconds() < closed_after_seconds:
             keep.append(h)
             continue
-
-        bal = _clob_conditional_balance_shares(client, str(token_id))
-        # bal=None → API hiccup; be conservative and keep it. bal>0 → still holding tokens, keep.
-        if bal is None or bal > 1e-9:
-            keep.append(h)
-            continue
-
         removed.append(h)
         log_transaction(
             "resolved",
@@ -492,8 +555,9 @@ def sweep_resolved_holdings(
             bracket=h.get("bracket_label"),
             buy_price=h.get("buy_price"),
             shares=h.get("shares"),
-            token_id=token_id,
-            reason="market_no_longer_active_and_clob_balance_zero",
+            token_id=h.get("token_id"),
+            event_end=end_dt.isoformat(),
+            reason="event_end_passed",
         )
 
     if removed:
@@ -508,20 +572,28 @@ def sweep_resolved_holdings(
     return removed
 
 
-def sweep_resolved_dry_holdings(active_keys: set[tuple[str, str]]) -> list[dict]:
-    """Dry-run equivalent: drop dry-run holdings whose event is no longer active.
-
-    No on-chain check available, so we just trust the active-events snapshot after a grace period.
-    """
+def sweep_resolved_dry_holdings(
+    active_keys: set[tuple[str, str]],
+    *,
+    closed_after_seconds: float = 3600.0,
+) -> list[dict]:
+    """Dry-run equivalent of sweep_resolved_holdings — same date-range logic, dry-run paths."""
     if not DRY_RUN_HOLDINGS_PATH.exists():
         return []
     with open(DRY_RUN_HOLDINGS_PATH) as f:
         holdings = json.load(f)
+
+    now = datetime.now(timezone.utc)
     removed: list[dict] = []
     keep: list[dict] = []
+    end_cache: dict[str, str | None] = {}
     for h in holdings:
         key = (h.get("event_slug"), h.get("bracket_label"))
-        if key in active_keys or _holding_age_seconds(h) < 600.0:
+        if key in active_keys:
+            keep.append(h)
+            continue
+        end_dt = _holding_end_dt(h, cache=end_cache)
+        if end_dt is None or (now - end_dt).total_seconds() < closed_after_seconds:
             keep.append(h)
             continue
         removed.append(h)
@@ -531,7 +603,8 @@ def sweep_resolved_dry_holdings(active_keys: set[tuple[str, str]]) -> list[dict]
             bracket=h.get("bracket_label"),
             buy_price=h.get("buy_price"),
             shares=h.get("shares"),
-            reason="market_no_longer_active",
+            event_end=end_dt.isoformat(),
+            reason="event_end_passed",
         )
     if removed:
         with open(DRY_RUN_HOLDINGS_PATH, "w") as f:
@@ -1508,8 +1581,8 @@ def run_bot():
             active_keys = set(zip(df["event_slug"], df["bracket_label"]))
             if dry_run:
                 sweep_resolved_dry_holdings(active_keys)
-            elif client is not None:
-                sweep_resolved_holdings(client, active_keys)
+            else:
+                sweep_resolved_holdings(None, active_keys)
 
             holdings = load_holdings(dry_run=dry_run)
             n_positions = len(set((h["event_slug"], h["bracket_label"]) for h in holdings))
@@ -1625,7 +1698,14 @@ def run_bot():
                             if state["balance"] < bet_usd:
                                 continue
                             shares = bet_usd / row["price"]
-                            add_dry_holding(row["event_slug"], row["bracket_label"], row["price"], shares, row["token_id"])
+                            add_dry_holding(
+                                row["event_slug"],
+                                row["bracket_label"],
+                                row["price"],
+                                shares,
+                                row["token_id"],
+                                event_end=row.get("event_end"),
+                            )
                             state["balance"] -= bet_usd
                             save_dry_run_state(state)
                             log_dry_transaction("buy", event_slug=row["event_slug"], bracket=row["bracket_label"],
@@ -1656,6 +1736,7 @@ def run_bot():
                                     shares,
                                     row["token_id"],
                                     resp.get("orderID", resp.get("orderId", "")),
+                                    event_end=row.get("event_end"),
                                 )
                                 log_transaction(
                                     "buy",
@@ -1810,7 +1891,8 @@ def main():
     parser.add_argument("--holdings", action="store_true", help="Show holdings")
     parser.add_argument("--transactions", action="store_true", help="Show recent transactions")
     parser.add_argument("--reset-dry", action="store_true", help="Reset dry run state (balance + holdings) and exit")
-    parser.add_argument("--sweep-stale", action="store_true", help="Drop holdings whose markets resolved (on-chain balance == 0) and exit")
+    parser.add_argument("--sweep-stale", action="store_true", help="Drop holdings whose event endDate has passed (with --grace-min, default 0) and exit")
+    parser.add_argument("--grace-min", type=float, default=0.0, help="Minutes past event endDate before --sweep-stale removes a holding (default: 0)")
     parser.add_argument("--correlations", action="store_true", help="Print feature correlations vs max_return_all")
     parser.add_argument("--train-only", action="store_true", help="Pre-train model and exit")
     parser.add_argument("--backtest", type=int, nargs="?", const=120, metavar="DAYS", help="Run 120-day backtest (default: 120)")
@@ -1878,11 +1960,11 @@ def main():
         active_keys: set[tuple[str, str]] = set()
         if not df.empty:
             active_keys = set(zip(df["event_slug"], df["bracket_label"]))
+        grace_s = float(args.grace_min) * 60.0
         if dry:
-            removed = sweep_resolved_dry_holdings(active_keys)
+            removed = sweep_resolved_dry_holdings(active_keys, closed_after_seconds=grace_s)
         else:
-            client = get_clob_client()
-            removed = sweep_resolved_holdings(client, active_keys, grace_seconds=0.0)
+            removed = sweep_resolved_holdings(None, active_keys, closed_after_seconds=grace_s)
         print(f"Removed {len(removed)} stale holding(s).")
         return
 
