@@ -1283,7 +1283,11 @@ def _print_polymarket_order_error(exc: BaseException, *, sell: bool = False) -> 
 
 
 def _clob_buy_side_price(client, token_id: str) -> float | None:
-    """CLOB executable BUY price for token (for comparing to Gamma snapshot)."""
+    """CLOB executable BUY price for token (for comparing to Gamma snapshot).
+
+    Returns None on any failure (missing orderbook, network error, malformed response) so
+    callers can cleanly fall back to a limit order instead of crashing the loop.
+    """
     try:
         r = client.get_price(token_id, side="BUY")
         if isinstance(r, dict):
@@ -1292,7 +1296,7 @@ def _clob_buy_side_price(client, token_id: str) -> float | None:
                 return None
             return float(v)
         return float(r)
-    except (TypeError, ValueError, KeyError, AttributeError):
+    except Exception:
         return None
 
 
@@ -1420,7 +1424,11 @@ def _sell_shares_capped(
 
 
 def _clob_sell_side_price(client, token_id: str) -> float | None:
-    """Best live SELL price on the CLOB (lowest ask). Used to decide market vs. limit sell."""
+    """Best live SELL price on the CLOB (lowest ask). Used to decide market vs. limit sell.
+
+    Returns None on any failure (e.g. PolyApiException 404 "No orderbook exists" for tokens with
+    no live book) so callers can cleanly fall back to a limit order instead of crashing the loop.
+    """
     try:
         r = client.get_price(token_id, side="SELL")
         if isinstance(r, dict):
@@ -1429,7 +1437,7 @@ def _clob_sell_side_price(client, token_id: str) -> float | None:
                 return None
             return float(v)
         return float(r)
-    except (TypeError, ValueError, KeyError, AttributeError):
+    except Exception:
         return None
 
 
